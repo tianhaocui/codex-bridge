@@ -1,0 +1,33 @@
+<idea-plugin>
+    <id>com.codexbridge.idea</id>
+    <name>Codex Bridge</name>
+    <vendor>cuitianhao</vendor>
+    <description><![CDATA[
+        Codex Bridge plugin version with in-IDE tool window and fixed Project A from current IDEA project.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <notificationGroup id="Codex Bridge" displayType="BALLOON"/>
+        <toolWindow id="Codex Bridge"
+                    anchor="right"
+                    factoryClass="com.codexbridge.idea.CodexBridgeToolWindowFactory"
+                    canCloseContents="false"/>
+    </extensions>
+
+    <actions>
+        <action
+                id="CodexBridge.OpenWithCurrentProject"
+                class="com.codexbridge.idea.OpenCodexBridgeAction"
+                text="Open Codex Bridge Tool Window"
+                description="Open Codex Bridge tool window"/>
+
+        <group id="CodexBridge.Group" text="Codex Bridge" popup="true">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+            <action id="CodexBridge.OpenWithCurrentProject.Ref"
+                    class="com.codexbridge.idea.OpenCodexBridgeAction"
+                    text="Open Tool Window"/>
+        </group>
+    </actions>
+</idea-plugin>

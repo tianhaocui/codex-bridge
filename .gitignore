@@ -1,0 +1,26 @@
+.DS_Store
+
+# Swift
+.build/
+
+# Node / VSCode plugin
+node_modules/
+dist/
+out/
+*.vsix
+plugins/vscode-codex-bridge/.vsixbuild/
+
+# IntelliJ plugin / Gradle
+.gradle/
+.kotlin/
+build/
+**/build/
+plugins/idea-codex-bridge/.gradle-home/
+plugins/idea-codex-bridge/.tooling/
+plugins/idea-codex-bridge/.intellij-local/
+
+# Temporary generated schemas
+.tmp-schema/
+
+# Logs
+*.log
