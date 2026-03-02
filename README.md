@@ -1,73 +1,105 @@
-# Codex Bridge macOS App
+# Codex Bridge
 
-一个在 macOS 上运行的 SwiftUI 桌面 App，用于桥接两个项目中的 Codex 会话，实现手动双向对话。
+Codex Bridge 是一个面向跨项目协作调试的桥接工具集。  
+它把两个 Codex 会话（A/B）放到同一视图中，支持手动或自动互发，帮助你在两个项目、两个上下文之间快速协同。
 
-## 功能
+当前包含三个版本：
+- `macOS App`（SwiftUI 桌面应用）
+- `VSCode 插件`
+- `IntelliJ IDEA 插件`
 
-- 单输入框 + 三发送按钮：`发给A` / `发给B` / `同时发送`
-- 统一对话窗口：A/B/你/系统消息合并显示
-- 会话复用：支持 `codex exec resume <SESSION_ID>`
-- 新会话：会话ID留空即可
-- 记录可复制：支持复制 A/B 对话文本
-- 输入快捷键：`Enter` 发送，`Shift+Enter` 换行
-- 消息分隔：每条消息独立卡片，带角色和时间
-- 流式回复：生成中实时刷新消息内容
-- 可打断：A/B 面板可中断当前输出
-- 固定角色颜色：你(蓝) / A(绿) / B(橙) / 系统(灰)
-- 常驻模式：A/B 各自保持长连接，不再每条消息重新启动 `codex`
-- 阶段完成自动停：命中关键词后自动关闭互发
-- Markdown 渲染：消息内容按 Markdown 显示（标题/列表/代码块）
-- 改动面板：按 A/B 查看本轮文件列表与 unified diff
-- 推理摘要内联显示：在统一对话框中以“系统消息”实时展示 reasoning summary（非完整内部推理）
-- 自动选项：启动时读取 `~/.codex/config.toml` 和 `~/.codex/history.jsonl`，提供项目与会话下拉选项
-  - 会话显示为 `短ID + 首句预览`，选择后回填完整 `session_id`
-  - A/B 会话按各自项目路径过滤（基于 session_meta.cwd）
-  - 初始消息和 A/B 模板默认为空，不再自动填充提示词
-  - 轮次方向：A轮= A -> B，B轮= B -> A
+## 为什么做这个项目
 
-## 目录
+当你需要同时推进两个项目（例如主服务与 SDK、前后端联调、跨仓修复）时，常见痛点是：
+- 对话分散在不同窗口，很难跟踪阶段推进
+- A/B 会话之间转述成本高，容易丢信息
+- Diff、回复、阶段状态不在一个上下文里
 
-- `Package.swift`
-- `Sources/CodexBridgeApp/CodexBridgeApp.swift`
-- `Sources/CodexBridgeApp/ContentView.swift`
-- `Sources/CodexBridgeApp/BridgeEngine.swift`
+Codex Bridge 的目标是把这些动作整合到一条协作流里。
 
-## 运行
+## 核心能力
 
-### 方式1：命令行
+- 双侧会话：`发给A` / `发给B` / `同时发送`
+- 自动互发：A 回复可自动转发给 B（反之亦然）
+- 阶段完成约束：支持单行 JSON 协议识别  
+  - `{"bridge_stage":"continue"}`
+  - `{"bridge_stage":"done"}`
+- 实时状态：显示 A/B 是否忙碌、生成中动画、可一键打断
+- 会话复用：按 `session_id` 续接历史会话
+- 项目/会话下拉：自动读取本机 Codex 配置与历史进行筛选
+
+## 仓库结构
+
+- `Sources/CodexBridgeApp/`：macOS App（Swift）
+- `plugins/vscode-codex-bridge/`：VSCode 插件（TypeScript）
+- `plugins/idea-codex-bridge/`：IDEA 插件（Kotlin）
+- `LICENSE`：Apache License 2.0
+
+## 环境要求
+
+- 已安装并可执行 `codex` CLI
+- 已完成 Codex 登录认证
+- 推荐先验证：
+
+```bash
+codex --version
+codex app-server --help
+```
+
+## 快速开始
+
+### 1) macOS App
 
 ```bash
 cd /Users/wulingren/codex-bridge-macapp
 swift run
 ```
 
-### 方式2：Xcode
+或用 Xcode 打开：
 
 ```bash
 open /Users/wulingren/codex-bridge-macapp/Package.swift
 ```
 
-然后在 Xcode 中直接 `Run`。
-
-## 使用步骤
-
-1. 在“连接设置”里填好 `A项目路径`、`B项目路径`
-2. 选择或填写 `A会话ID`、`B会话ID`（留空表示新会话）
-3. 在 A 或 B 面板输入消息
-4. 点击对应面板的“发送”
-5. 在两边对话窗口查看回复
-
-## 注意
-
-- 依赖本机可执行 `codex` 命令（已登录）
-- `session ID` 不能为空
-- 建议先在终端手动验证一次会话可续：
+### 2) VSCode 插件
 
 ```bash
-codex exec resume <SESSION_ID> -C <项目路径> "hello"
+cd /Users/wulingren/codex-bridge-macapp/plugins/vscode-codex-bridge
+npm install
+npm run build
 ```
 
-## 已知限制
+在 VSCode 中使用 `Install from VSIX` 安装打包产物（如需发布请用 `vsce package`）。
 
-- 不是 Codex 原生 P2P，底层是 App 调用本机 `codex` 命令转发
-- 留空新会话时，CLI 可能创建新会话但不会自动回填会话ID
+### 3) IDEA 插件
+
+```bash
+cd /Users/wulingren/codex-bridge-macapp/plugins/idea-codex-bridge
+GRADLE_USER_HOME=.gradle-home ./.tooling/gradle-8.10.2/bin/gradle clean buildPlugin
+```
+
+安装方式：
+- `Settings` -> `Plugins` -> `⚙` -> `Install Plugin from Disk...`
+- 选择 `build/distributions/*.zip`
+
+## 使用建议
+
+1. A 固定当前项目，B 选择目标项目
+2. 优先通过下拉选择会话；手动输入会覆盖下拉选择
+3. 开启“自动互发 + 阶段完成自动停止”时，建议在系统提示中明确要求输出协议 JSON
+4. 大改动场景建议固定一个“阶段目标”，每轮只推进一个可验收点
+
+## 常见问题
+
+- 报错 `Cannot run program "codex"`：  
+  IDEA 进程环境找不到 `codex`，请确认 `PATH` 或配置 `CODEX_BIN`
+
+- 报错 `codex app-server 已断开连接`：  
+  通常是 CLI 环境依赖问题（例如 shell 环境与 IDE 环境不一致）。先在终端验证 `codex app-server --help` 是否正常。
+
+- 会话下拉为空：  
+  检查 `~/.codex/config.toml` 与 `~/.codex/history.jsonl` 是否存在且有有效记录。
+
+## 许可证
+
+本项目基于 **Apache License 2.0** 开源，详见 [LICENSE](./LICENSE)。
