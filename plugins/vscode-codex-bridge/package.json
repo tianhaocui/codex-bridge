@@ -24,7 +24,8 @@
   },
   "scripts": {
     "build": "tsc -p .",
-    "watch": "tsc -p . --watch"
+    "watch": "tsc -p . --watch",
+    "test": "npm run build && node test/bridgeProtocol.test.js && node test/codexExecutable.test.js"
   },
   "devDependencies": {
     "@types/node": "^20.14.11",

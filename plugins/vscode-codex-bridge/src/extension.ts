@@ -4,6 +4,13 @@ import { randomUUID } from 'node:crypto';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { promises as fs, Dirent } from 'node:fs';
+import {
+  composeOutboundMessage,
+  DEFAULT_STAGE_DONE_MARKERS,
+  isStageDone,
+  sanitizedRelayPayload
+} from './core/bridgeProtocol';
+import { resolveCodexExecutable } from './core/codexExecutable';
 
 type Side = 'A' | 'B';
 type Role = 'user' | 'assistant' | 'system';
@@ -107,7 +114,7 @@ class CodexWorker {
     this.configuredCwd = cwd;
     this.configuredResumeId = normalizedResume;
 
-    this.startProcess();
+    this.startProcess(cwd);
 
     await this.sendRequest('initialize', {
       clientInfo: { name: 'codex-bridge-vscode', version: '0.1.1' },
@@ -158,8 +165,10 @@ class CodexWorker {
     });
   }
 
-  private startProcess(): void {
-    const child = spawn('codex', ['app-server', '--listen', 'stdio://'], {
+  private startProcess(cwd: string): void {
+    const codexExec = resolveCodexExecutable();
+    const child = spawn(codexExec, ['app-server', '--listen', 'stdio://'], {
+      cwd,
       stdio: 'pipe'
     });
 
@@ -350,13 +359,11 @@ class BridgeController {
     autoRelayEnabled: false,
     stopOnStageDone: true,
     chatControlExpanded: false,
-    stageDoneMarkers: '{"bridge_stage":"done"},任务完成,阶段完成,END_OF_TASK,[DONE]',
+    stageDoneMarkers: DEFAULT_STAGE_DONE_MARKERS,
     chatItems: [],
     isSendingA: false,
     isSendingB: false
   };
-
-  private stageJsonPattern = /^\s*\{\s*"bridge_stage"\s*:\s*"(done|continue)"\s*\}\s*$/i;
 
   attachPanel(panel: vscode.WebviewPanel, projectAPath: string): void {
     this.panel = panel;
@@ -448,7 +455,10 @@ class BridgeController {
     const assistantId = randomUUID();
     this.appendChat({ id: assistantId, time: Date.now(), side, role: 'assistant', text: '' });
 
-    const outboundMessage = this.composeOutboundMessage(message);
+    const outboundMessage = composeOutboundMessage(message, {
+      autoRelayEnabled: this.state.autoRelayEnabled,
+      stopOnStageDone: this.state.stopOnStageDone
+    });
     worker.send(
       outboundMessage,
       projectPath,
@@ -479,7 +489,11 @@ class BridgeController {
           return;
         }
 
-        if (this.state.autoRelayEnabled && this.state.stopOnStageDone && this.isStageDone(result.text)) {
+        if (
+          this.state.autoRelayEnabled &&
+          this.state.stopOnStageDone &&
+          isStageDone(result.text, this.state.stageDoneMarkers)
+        ) {
           this.state.autoRelayEnabled = false;
           this.appendSystem('检测到阶段完成，已停止自动互发');
           this.sync();
@@ -487,7 +501,7 @@ class BridgeController {
         }
 
         if (this.state.autoRelayEnabled) {
-          const payload = this.sanitizedRelayPayload(result.text);
+          const payload = sanitizedRelayPayload(result.text);
           if (payload.trim()) {
             this.sendTo(side === 'A' ? 'B' : 'A', payload, true);
           }
@@ -519,36 +533,6 @@ class BridgeController {
     } else {
       this.appendSystem('当前无进行中的任务可打断');
     }
-  }
-
-  private composeOutboundMessage(message: string): string {
-    if (!this.state.autoRelayEnabled || !this.state.stopOnStageDone) return message;
-    return `${message}\n\n[Bridge 控制协议]\n- 回复最后一行必须是单行 JSON：{"bridge_stage":"continue"} 或 {"bridge_stage":"done"}`;
-  }
-
-  private isStageDone(text: string): boolean {
-    const lines = text.split(/\r?\n/).map((v) => v.trim()).filter(Boolean);
-    const last = lines.length > 0 ? lines[lines.length - 1] : '';
-    const match = this.stageJsonPattern.exec(last);
-    if (match?.[1]?.toLowerCase() === 'done') return true;
-
-    const markers = this.state.stageDoneMarkers
-      .split(/[\n,;|]/)
-      .map((v) => v.trim().toLowerCase())
-      .filter(Boolean);
-
-    const normalized = text.toLowerCase();
-    return markers.some((m) => normalized.includes(m));
-  }
-
-  private sanitizedRelayPayload(text: string): string {
-    const lines = text.split(/\r?\n/);
-    if (lines.length === 0) return text;
-    const last = lines[lines.length - 1].trim();
-    if (this.stageJsonPattern.test(last)) {
-      return lines.slice(0, -1).join('\n').trim();
-    }
-    return text;
   }
 
   private bindTurnId(messageId: string, turnId: string): void {
