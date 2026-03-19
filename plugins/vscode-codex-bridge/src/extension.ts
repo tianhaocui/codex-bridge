@@ -807,85 +807,306 @@ function getHtml(webview: vscode.Webview): string {
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Codex Bridge</title>
   <style>
-    body { font-family: var(--vscode-font-family); margin: 0; padding: 12px; color: var(--vscode-foreground); }
-    .panel { border: 1px solid var(--vscode-editorWidget-border); padding: 10px; border-radius: 6px; margin-bottom: 10px; }
-    .row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
-    .row input:not([type="checkbox"]), textarea {
+    :root {
+      --bg: var(--vscode-editor-background);
+      --panel: color-mix(in srgb, var(--vscode-editorWidget-background) 86%, transparent);
+      --panel-strong: color-mix(in srgb, var(--vscode-sideBar-background) 72%, var(--vscode-editor-background));
+      --border: var(--vscode-editorWidget-border);
+      --border-soft: color-mix(in srgb, var(--vscode-editorWidget-border) 55%, transparent);
+      --muted: var(--vscode-descriptionForeground);
+      --accent: var(--vscode-button-background);
+      --accent-fg: var(--vscode-button-foreground);
+      --accent-soft: color-mix(in srgb, var(--vscode-button-background) 16%, transparent);
+      --danger-soft: color-mix(in srgb, var(--vscode-errorForeground) 12%, transparent);
+      --shadow: 0 10px 30px rgba(0,0,0,0.12);
+      --radius: 14px;
+      --radius-sm: 10px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: var(--vscode-font-family);
+      margin: 0;
+      padding: 16px;
+      color: var(--vscode-foreground);
+      background:
+        radial-gradient(circle at top right, color-mix(in srgb, var(--vscode-button-background) 14%, transparent), transparent 26%),
+        linear-gradient(180deg, color-mix(in srgb, var(--vscode-editor-background) 92%, black), var(--vscode-editor-background));
+    }
+    .app {
+      display: grid;
+      grid-template-columns: minmax(320px, 360px) minmax(0, 1fr);
+      gap: 14px;
+      align-items: start;
+    }
+    .panel {
+      border: 1px solid var(--border-soft);
+      background: var(--panel);
+      backdrop-filter: blur(8px);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 14px 16px 10px;
+    }
+    .panel-body { padding: 0 16px 16px; }
+    .hero {
+      padding: 16px;
+      border-bottom: 1px solid var(--border-soft);
+      background:
+        linear-gradient(135deg, color-mix(in srgb, var(--accent) 15%, transparent), transparent 55%),
+        linear-gradient(180deg, color-mix(in srgb, var(--panel-strong) 92%, transparent), transparent);
+    }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+    .title {
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin: 0 0 6px;
+    }
+    .subtitle {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.45;
+      font-size: 12px;
+    }
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 12px;
+      border-radius: 999px;
+      background: var(--panel-strong);
+      border: 1px solid var(--border-soft);
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--vscode-testing-iconPassed);
+      box-shadow: 0 0 0 6px color-mix(in srgb, var(--vscode-testing-iconPassed) 14%, transparent);
+    }
+    .section-title {
+      margin: 0;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .section-desc {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .stack { display: flex; flex-direction: column; gap: 12px; }
+    .field-grid { display: grid; gap: 10px; }
+    .dual-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .field label {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--muted);
+    }
+    input:not([type="checkbox"]), textarea, select {
       width: 100%;
       background: var(--vscode-input-background);
       color: var(--vscode-input-foreground);
       border: 1px solid var(--vscode-input-border);
-      border-radius: 4px;
-      padding: 6px;
+      border-radius: var(--radius-sm);
+      padding: 10px 12px;
       outline: none;
       font: inherit;
       caret-color: var(--vscode-editorCursor-foreground);
+      transition: border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease;
     }
-    .row select {
-      width: 100%;
-      background: var(--vscode-input-background);
-      color: var(--vscode-input-foreground);
-      border: 1px solid var(--vscode-input-border);
-      border-radius: 4px;
-      padding: 6px 28px 6px 6px;
-      outline: none;
-      font: inherit;
-      appearance: auto;
-      -webkit-appearance: menulist;
-    }
-    .row input:not([type="checkbox"])::placeholder, textarea::placeholder {
+    select { padding-right: 30px; }
+    input:not([type="checkbox"])::placeholder, textarea::placeholder {
       color: var(--vscode-input-placeholderForeground);
     }
-    .row input:not([type="checkbox"]):focus, .row select:focus, textarea:focus {
+    input:not([type="checkbox"]):focus, select:focus, textarea:focus {
       border-color: var(--vscode-focusBorder);
-      box-shadow: 0 0 0 1px var(--vscode-focusBorder) inset;
+      box-shadow: 0 0 0 1px var(--vscode-focusBorder) inset, 0 0 0 4px color-mix(in srgb, var(--vscode-focusBorder) 12%, transparent);
     }
-    .row input[readonly] {
-      opacity: 0.95;
+    input[readonly] {
+      opacity: 0.92;
+      background: color-mix(in srgb, var(--vscode-input-background) 80%, var(--vscode-editor-background));
     }
-    input:-webkit-autofill, textarea:-webkit-autofill, select:-webkit-autofill {
-      -webkit-text-fill-color: var(--vscode-input-foreground);
-      -webkit-box-shadow: 0 0 0px 1000px var(--vscode-input-background) inset;
-      transition: background-color 9999s ease-in-out 0s;
+    textarea {
+      min-height: 112px;
+      resize: vertical;
+      line-height: 1.5;
     }
-    .row input[type="checkbox"] { width: auto; margin: 0; }
-    textarea { min-height: 72px; }
-    button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 6px 10px; border-radius: 4px; cursor: pointer; }
-    button.secondary { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
+    .hint {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .toggle-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .toggle-card {
+      flex: 1 1 150px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 11px 12px;
+      border: 1px solid var(--border-soft);
+      border-radius: 12px;
+      background: color-mix(in srgb, var(--panel-strong) 72%, transparent);
+    }
+    .toggle-copy strong {
+      display: block;
+      font-size: 12px;
+      margin-bottom: 2px;
+    }
+    .toggle-copy span {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.35;
+    }
+    input[type="checkbox"] { width: auto; margin: 0; }
+    .chat-shell {
+      display: grid;
+      grid-template-rows: auto minmax(320px, 1fr) auto;
+      min-height: 72vh;
+    }
+    .chat {
+      margin: 0 16px;
+      max-height: 56vh;
+      overflow: auto;
+      border: 1px solid var(--border-soft);
+      border-radius: 12px;
+      padding: 12px;
+      background: color-mix(in srgb, var(--vscode-editor-background) 88%, black 12%);
+    }
+    .msg {
+      border: 1px solid var(--border-soft);
+      border-radius: 12px;
+      padding: 10px 12px;
+      margin-bottom: 10px;
+      background: color-mix(in srgb, var(--panel-strong) 68%, transparent);
+    }
+    .msg-a { border-left: 3px solid color-mix(in srgb, var(--accent) 88%, white 12%); }
+    .msg-b { border-left: 3px solid color-mix(in srgb, var(--vscode-terminal-ansiMagenta) 80%, white 20%); }
+    .msg-sys { border-left: 3px solid color-mix(in srgb, var(--vscode-descriptionForeground) 55%, transparent); }
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      font-size: 11px;
+      opacity: 0.88;
+      margin-bottom: 6px;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 7px;
+      border-radius: 999px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      background: var(--accent-soft);
+      color: var(--vscode-foreground);
+    }
+    .badge-b { background: color-mix(in srgb, var(--vscode-terminal-ansiMagenta) 15%, transparent); }
+    .badge-sys { background: color-mix(in srgb, var(--vscode-descriptionForeground) 12%, transparent); }
+    .thinking {
+      font-size: 11px;
+      padding: 8px 10px;
+      margin-bottom: 8px;
+      border-radius: 8px;
+      background: var(--vscode-editor-inactiveSelectionBackground);
+      white-space: pre-wrap;
+      border: 1px dashed color-mix(in srgb, var(--border) 65%, transparent);
+    }
+    .text { white-space: pre-wrap; line-height: 1.55; }
+    .composer {
+      padding: 12px 16px 16px;
+      border-top: 1px solid var(--border-soft);
+      background: linear-gradient(180deg, transparent, color-mix(in srgb, var(--panel-strong) 78%, transparent));
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      justify-content: space-between;
+      margin-top: 10px;
+    }
+    .button-group {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    button {
+      background: var(--accent);
+      color: var(--accent-fg);
+      border: 1px solid transparent;
+      padding: 9px 14px;
+      border-radius: 10px;
+      cursor: pointer;
+      font: inherit;
+      font-weight: 600;
+      transition: transform 120ms ease, filter 120ms ease, border-color 120ms ease;
+    }
+    button:hover { filter: brightness(1.05); }
+    button:active { transform: translateY(1px); }
+    button.secondary {
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+    }
     .icon-btn {
-      min-width: 30px;
-      width: 30px;
-      height: 30px;
+      min-width: 38px;
+      width: 38px;
+      height: 38px;
       padding: 0;
       display: inline-flex;
       align-items: center;
       justify-content: center;
       font-size: 13px;
       line-height: 1;
-      border-radius: 6px;
+      border-radius: 10px;
     }
     .stop-btn {
-      border: 1px solid var(--vscode-button-border, var(--vscode-contrastBorder));
-      box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--vscode-button-secondaryForeground) 8%, transparent);
+      background: var(--danger-soft);
+      color: var(--vscode-errorForeground);
+      border-color: color-mix(in srgb, var(--vscode-errorForeground) 24%, transparent);
     }
     .stop-btn:hover {
-      background: var(--vscode-button-secondaryHoverBackground);
+      background: color-mix(in srgb, var(--vscode-errorForeground) 16%, transparent);
     }
-    .stop-btn:active {
-      transform: translateY(1px);
-      filter: brightness(0.96);
-    }
-    .toggle { display: inline-flex; align-items: center; gap: 6px; }
-    .chat { max-height: 52vh; overflow: auto; border: 1px solid var(--vscode-editorWidget-border); border-radius: 6px; padding: 8px; }
-    .msg { border: 1px solid var(--vscode-editorWidget-border); border-radius: 6px; padding: 8px; margin-bottom: 8px; }
-    .meta { font-size: 11px; opacity: 0.8; margin-bottom: 4px; }
-    .thinking { font-size: 11px; padding: 6px; margin-bottom: 6px; border-radius: 4px; background: var(--vscode-editor-inactiveSelectionBackground); white-space: pre-wrap; }
-    .text { white-space: pre-wrap; }
     .typing {
       display: inline-flex;
       align-items: center;
       gap: 6px;
-      color: var(--vscode-descriptionForeground);
+      color: var(--muted);
       font-style: italic;
       letter-spacing: 0.1px;
     }
@@ -909,39 +1130,112 @@ function getHtml(webview: vscode.Webview): string {
       0%, 80%, 100% { transform: translateY(0); opacity: 0.25; }
       40% { transform: translateY(-2px); opacity: 0.95; }
     }
-    .muted { opacity: 0.8; font-size: 12px; }
+    .muted { opacity: 0.85; font-size: 12px; }
+    @media (max-width: 900px) {
+      .app { grid-template-columns: 1fr; }
+      .chat-shell { min-height: auto; }
+      .chat { max-height: 42vh; }
+      .dual-grid { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
-  <div class="panel">
-    <div class="row"><strong>Project A（固定）</strong><input id="projectA" readonly /></div>
-    <div class="row"><strong>Project B</strong><select id="projectBSelect"></select></div>
-    <div class="row"><input id="projectB" placeholder="Project B 可手动输入（优先）" /></div>
-    <div class="row">
-      <select id="sessionASelect"></select>
-      <select id="sessionBSelect"></select>
-    </div>
-    <div class="row">
-      <input id="sessionA" placeholder="A会话ID 可手动输入（优先）" />
-      <input id="sessionB" placeholder="B会话ID 可手动输入（优先）" />
-    </div>
-    <div class="row">
-      <label class="toggle">自动互发 <input type="checkbox" id="autoRelay" /></label>
-      <label class="toggle">阶段完成自动停止 <input type="checkbox" id="stopOnStageDone" /></label>
-    </div>
-  </div>
+  <div class="app">
+    <section class="panel">
+      <div class="hero">
+        <div class="eyebrow">Bridge Workspace</div>
+        <h1 class="title">Codex Bridge</h1>
+        <p class="subtitle">把 A/B 两侧会话放到同一个工作台里：选项目、选会话、控制自动互发，并在一个聊天流里查看状态。</p>
+      </div>
+      <div class="panel-body stack">
+        <div>
+          <h2 class="section-title">项目与会话</h2>
+          <p class="section-desc">A 侧固定为当前工作区，B 侧可从历史项目里选，也可以手动覆盖。</p>
+        </div>
+        <div class="field-grid">
+          <div class="field">
+            <label for="projectA">Project A（当前工作区）</label>
+            <input id="projectA" readonly />
+          </div>
+          <div class="field">
+            <label for="projectBSelect">Project B（历史候选）</label>
+            <select id="projectBSelect"></select>
+          </div>
+          <div class="field">
+            <label for="projectB">Project B（手动覆盖）</label>
+            <input id="projectB" placeholder="手动输入路径时优先于下拉选择" />
+          </div>
+          <div class="dual-grid">
+            <div class="field">
+              <label for="sessionASelect">Session A（候选）</label>
+              <select id="sessionASelect"></select>
+            </div>
+            <div class="field">
+              <label for="sessionBSelect">Session B（候选）</label>
+              <select id="sessionBSelect"></select>
+            </div>
+          </div>
+          <div class="dual-grid">
+            <div class="field">
+              <label for="sessionA">Session A（手动覆盖）</label>
+              <input id="sessionA" placeholder="优先使用手动输入的 A 会话 ID" />
+            </div>
+            <div class="field">
+              <label for="sessionB">Session B（手动覆盖）</label>
+              <input id="sessionB" placeholder="优先使用手动输入的 B 会话 ID" />
+            </div>
+          </div>
+        </div>
+        <div>
+          <h2 class="section-title">桥接策略</h2>
+          <p class="section-desc">打开自动互发后，Bridge 会把一侧结果继续转发给另一侧；启用“阶段完成自动停止”时，会识别末行 JSON 控制标记。</p>
+        </div>
+        <div class="toggle-row">
+          <label class="toggle-card">
+            <div class="toggle-copy">
+              <strong>自动互发</strong>
+              <span>把一边的输出继续转发到另一边</span>
+            </div>
+            <input type="checkbox" id="autoRelay" />
+          </label>
+          <label class="toggle-card">
+            <div class="toggle-copy">
+              <strong>阶段完成自动停止</strong>
+              <span>检测 <code>{"bridge_stage":"done"}</code> 后停止链路</span>
+            </div>
+            <input type="checkbox" id="stopOnStageDone" />
+          </label>
+        </div>
+      </div>
+    </section>
 
-  <div class="panel">
-    <div class="chat" id="chat"></div>
-    <div class="row" style="margin-top:8px;"><textarea id="message" placeholder="输入消息"></textarea></div>
-    <div class="muted">回车发送，Shift+回车换行</div>
-    <div class="row">
-      <button id="sendA">发给A</button>
-      <button id="sendB" class="secondary">发给B</button>
-      <button id="sendBoth" class="secondary">同时发送</button>
-      <button id="interrupt" class="secondary icon-btn stop-btn" title="停止" aria-label="停止">■</button>
-      <span id="status" class="muted"></span>
-    </div>
+    <section class="panel chat-shell">
+      <div class="panel-header">
+        <div>
+          <div class="eyebrow">Conversation</div>
+          <h2 class="title" style="font-size:16px; margin:0;">Bridge Console</h2>
+        </div>
+        <div class="status-pill"><span class="status-dot" id="statusDot"></span><span id="status">A: 空闲 | B: 空闲</span></div>
+      </div>
+      <div class="chat" id="chat"></div>
+      <div class="composer">
+        <div class="field">
+          <label for="message">发送内容</label>
+          <textarea id="message" placeholder="输入消息。回车发送到 A，Shift + 回车换行。"></textarea>
+        </div>
+        <div class="actions">
+          <div>
+            <div class="hint">默认 Enter 发送到 A；也可以显式发给 B 或同时发送。</div>
+          </div>
+          <div class="button-group">
+            <button id="sendA">发给 A</button>
+            <button id="sendB" class="secondary">发给 B</button>
+            <button id="sendBoth" class="secondary">同时发送</button>
+            <button id="interrupt" class="icon-btn stop-btn" title="停止全部" aria-label="停止全部">■</button>
+          </div>
+        </div>
+      </div>
+    </section>
   </div>
 
   <script nonce="${nonce}">
@@ -1029,19 +1323,28 @@ function getHtml(webview: vscode.Webview): string {
         latestState.sessionB || ''
       );
 
+      const isBusyA = !!latestState.isSendingA;
+      const isBusyB = !!latestState.isSendingB;
       $('status').textContent =
-        'A: ' + (latestState.isSendingA ? '发送中' : '空闲') +
-        ' | B: ' + (latestState.isSendingB ? '发送中' : '空闲');
+        'A: ' + (isBusyA ? '发送中' : '空闲') +
+        ' | B: ' + (isBusyB ? '发送中' : '空闲');
+      $('statusDot').style.background = (isBusyA || isBusyB)
+        ? 'var(--vscode-progressBar-background)'
+        : 'var(--vscode-testing-iconPassed)';
+      $('statusDot').style.boxShadow = (isBusyA || isBusyB)
+        ? '0 0 0 6px color-mix(in srgb, var(--vscode-progressBar-background) 16%, transparent)'
+        : '0 0 0 6px color-mix(in srgb, var(--vscode-testing-iconPassed) 14%, transparent)';
 
       const chat = $('chat');
       chat.innerHTML = '';
       for (const item of latestState.chatItems) {
         const div = document.createElement('div');
-        div.className = 'msg';
         const side = item.side || 'SYS';
+        div.className = 'msg ' + (side === 'A' ? 'msg-a' : side === 'B' ? 'msg-b' : 'msg-sys');
         const role = item.role.toUpperCase();
         const t = new Date(item.time).toLocaleTimeString();
-        div.innerHTML = '<div class=\"meta\">' + t + ' · ' + role + ' · ' + side + '</div>';
+        const sideBadgeClass = side === 'A' ? 'badge' : side === 'B' ? 'badge badge-b' : 'badge badge-sys';
+        div.innerHTML = '<div class=\"meta\"><span>' + t + '</span><span class=\"badge\">' + role + '</span><span class=\"' + sideBadgeClass + '\">' + side + '</span></div>';
 
         if (item.role === 'assistant' && item.turnId && reasoningByTurn[item.turnId]) {
           const thinking = document.createElement('div');
