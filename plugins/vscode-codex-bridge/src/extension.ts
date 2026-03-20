@@ -1167,22 +1167,14 @@ function getHtml(webview: vscode.Webview): string {
           </div>
           <div class="dual-grid">
             <div class="field">
-              <label for="sessionASelect">Session A（候选）</label>
-              <select id="sessionASelect"></select>
+              <label for="sessionA">Session A（候选）</label>
+              <input id="sessionA" list="sessionAOptions" placeholder="可直接输入，或从候选会话里选择" />
+              <datalist id="sessionAOptions"></datalist>
             </div>
             <div class="field">
-              <label for="sessionBSelect">Session B（候选）</label>
-              <select id="sessionBSelect"></select>
-            </div>
-          </div>
-          <div class="dual-grid">
-            <div class="field">
-              <label for="sessionA">Session A（手动覆盖）</label>
-              <input id="sessionA" placeholder="优先使用手动输入的 A 会话 ID" />
-            </div>
-            <div class="field">
-              <label for="sessionB">Session B（手动覆盖）</label>
-              <input id="sessionB" placeholder="优先使用手动输入的 B 会话 ID" />
+              <label for="sessionB">Session B（候选）</label>
+              <input id="sessionB" list="sessionBOptions" placeholder="可直接输入，或从候选会话里选择" />
+              <datalist id="sessionBOptions"></datalist>
             </div>
           </div>
         </div>
@@ -1246,13 +1238,11 @@ function getHtml(webview: vscode.Webview): string {
 
     function syncSettings() {
       const projectBFromSelect = $('projectBSelect').value || '';
-      const sessionAFromSelect = $('sessionASelect').value || '';
-      const sessionBFromSelect = $('sessionBSelect').value || '';
       vscode.postMessage({
         type: 'updateSettings',
         projectBPath: $('projectB').value.trim() || projectBFromSelect,
-        sessionA: $('sessionA').value.trim() || sessionAFromSelect,
-        sessionB: $('sessionB').value.trim() || sessionBFromSelect,
+        sessionA: $('sessionA').value.trim(),
+        sessionB: $('sessionB').value.trim(),
         autoRelayEnabled: $('autoRelay').checked,
         stopOnStageDone: $('stopOnStageDone').checked,
         chatControlExpanded: false,
@@ -1264,9 +1254,7 @@ function getHtml(webview: vscode.Webview): string {
       'projectB',
       'projectBSelect',
       'sessionA',
-      'sessionASelect',
       'sessionB',
-      'sessionBSelect',
       'autoRelay',
       'stopOnStageDone'
     ]) {
@@ -1394,38 +1382,24 @@ function getHtml(webview: vscode.Webview): string {
       const optionsForA = options.filter((item) => matchesProject(item.cwd || '', projectAPath || ''));
       const optionsForB = options.filter((item) => matchesProject(item.cwd || '', projectBPath || ''));
 
-      const selectA = $('sessionASelect');
-      const selectB = $('sessionBSelect');
-      selectA.innerHTML = '';
-      selectB.innerHTML = '';
+      const listA = $('sessionAOptions');
+      const listB = $('sessionBOptions');
+      listA.innerHTML = '';
+      listB.innerHTML = '';
 
-      const addDefault = (select, text) => {
+      const addOption = (list, item) => {
         const opt = document.createElement('option');
-        opt.value = '';
-        opt.textContent = text;
-        select.appendChild(opt);
+        opt.value = item.id;
+        opt.label = item.displayLabel;
+        list.appendChild(opt);
       };
-      addDefault(selectA, 'A会话（可空）');
-      addDefault(selectB, 'B会话（可空）');
-
       for (const item of optionsForA) {
-        const optA = document.createElement('option');
-        optA.value = item.id;
-        optA.textContent = item.displayLabel;
-        selectA.appendChild(optA);
+        addOption(listA, item);
       }
 
       for (const item of optionsForB) {
-        const optB = document.createElement('option');
-        optB.value = item.id;
-        optB.textContent = item.displayLabel;
-        selectB.appendChild(optB);
+        addOption(listB, item);
       }
-
-      const idsA = optionsForA.map((v) => v.id);
-      const idsB = optionsForB.map((v) => v.id);
-      selectA.value = selectedA && idsA.includes(selectedA) ? selectedA : '';
-      selectB.value = selectedB && idsB.includes(selectedB) ? selectedB : '';
     }
 
     function matchesProject(sessionCwd, projectPath) {
