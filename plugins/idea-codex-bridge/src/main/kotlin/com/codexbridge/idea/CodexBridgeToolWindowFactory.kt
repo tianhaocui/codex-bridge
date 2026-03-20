@@ -54,13 +54,9 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
 
         val sessionASelect = JComboBox<SessionComboItem>()
         val sessionBSelect = JComboBox<SessionComboItem>()
-        val sessionAField = JBTextField()
-        val sessionBField = JBTextField()
-        sessionAField.emptyText.text = "A会话ID 可手动输入（优先）"
-        sessionBField.emptyText.text = "B会话ID 可手动输入（优先）"
+        sessionASelect.isEditable = true
+        sessionBSelect.isEditable = true
         projectBField.text = stored.projectBPath
-        sessionAField.text = stored.sessionA
-        sessionBField.text = stored.sessionB
 
         val autoRelay = JBCheckBox("自动互发", stored.autoRelayEnabled)
         val stopOnDone = JBCheckBox("阶段完成自动停止", stored.stopOnStageDone)
@@ -73,12 +69,8 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
         projectBRow.add(projectBSelect, BorderLayout.CENTER)
 
         val sessionSelectRow = JPanel(GridLayout(1, 2, 6, 0))
-        sessionSelectRow.add(sessionASelect)
-        sessionSelectRow.add(sessionBSelect)
-
-        val sessionInputRow = JPanel(GridLayout(1, 2, 6, 0))
-        sessionInputRow.add(sessionAField)
-        sessionInputRow.add(sessionBField)
+        sessionSelectRow.add(wrapField("Session A（候选）", sessionASelect))
+        sessionSelectRow.add(wrapField("Session B（候选）", sessionBSelect))
 
         val optionsRow = JPanel(FlowLayout(FlowLayout.LEFT, 10, 0))
         optionsRow.add(autoRelay)
@@ -91,7 +83,6 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
         top.add(projectBRow)
         top.add(projectBField)
         top.add(sessionSelectRow)
-        top.add(sessionInputRow)
         top.add(optionsRow)
 
         val chatArea = JBTextArea()
@@ -216,49 +207,57 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
             return (projectBSelect.selectedItem as? String).orEmpty().trim()
         }
 
+        fun sessionComboValue(combo: JComboBox<SessionComboItem>): String {
+            val selected = combo.selectedItem
+            return when (selected) {
+                is SessionComboItem -> selected.id.ifBlank { selected.label }.trim()
+                is String -> selected.trim()
+                else -> combo.editor.item?.toString()?.trim().orEmpty()
+            }
+        }
+
         fun selectedSessionId(side: String): String {
-            val manual = if (side == "A") sessionAField.text.trim() else sessionBField.text.trim()
-            if (manual.isNotBlank()) return manual
-            val selected = if (side == "A") sessionASelect.selectedItem else sessionBSelect.selectedItem
-            return (selected as? SessionComboItem)?.id.orEmpty()
+            val combo = if (side == "A") sessionASelect else sessionBSelect
+            return sessionComboValue(combo)
+        }
+
+        fun applySessionSelection(combo: JComboBox<SessionComboItem>, model: DefaultComboBoxModel<SessionComboItem>, target: String) {
+            val trimmed = target.trim()
+            if (trimmed.isBlank()) {
+                combo.selectedIndex = 0
+                combo.editor.item = ""
+                return
+            }
+            for (i in 0 until model.size) {
+                val item = model.getElementAt(i)
+                if (item.id == trimmed) {
+                    combo.selectedIndex = i
+                    return
+                }
+            }
+            combo.selectedItem = trimmed
+            combo.editor.item = trimmed
         }
 
         fun updateSessionDropdowns() {
             val projectB = selectedProjectBPath()
+            val currentA = sessionComboValue(sessionASelect).ifBlank { stored.sessionA.trim() }
+            val currentB = sessionComboValue(sessionBSelect).ifBlank { stored.sessionB.trim() }
             val optionsForA = allSessions.filter { matchesProject(it.cwd, projectA) }
             val optionsForB = allSessions.filter { matchesProject(it.cwd, projectB) }
 
             val modelA = DefaultComboBoxModel<SessionComboItem>()
-            modelA.addElement(SessionComboItem("", "A会话（可空）"))
+            modelA.addElement(SessionComboItem("", "新会话（留空）"))
             optionsForA.forEach { modelA.addElement(SessionComboItem(it.id, it.displayLabel)) }
             sessionASelect.model = modelA
 
             val modelB = DefaultComboBoxModel<SessionComboItem>()
-            modelB.addElement(SessionComboItem("", "B会话（可空）"))
+            modelB.addElement(SessionComboItem("", "新会话（留空）"))
             optionsForB.forEach { modelB.addElement(SessionComboItem(it.id, it.displayLabel)) }
             sessionBSelect.model = modelB
 
-            val targetA = stored.sessionA.trim()
-            if (targetA.isNotBlank()) {
-                for (i in 0 until modelA.size) {
-                    val item = modelA.getElementAt(i)
-                    if (item.id == targetA) {
-                        sessionASelect.selectedIndex = i
-                        break
-                    }
-                }
-            }
-
-            val targetB = stored.sessionB.trim()
-            if (targetB.isNotBlank()) {
-                for (i in 0 until modelB.size) {
-                    val item = modelB.getElementAt(i)
-                    if (item.id == targetB) {
-                        sessionBSelect.selectedIndex = i
-                        break
-                    }
-                }
-            }
+            applySessionSelection(sessionASelect, modelA, currentA)
+            applySessionSelection(sessionBSelect, modelB, currentB)
         }
 
         fun loadOptions() {
@@ -357,12 +356,8 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
         fun saveSettings() {
             val s = settings.state
             s.projectBPath = projectBField.text.trim()
-            s.sessionA = sessionAField.text.trim().ifBlank {
-                (sessionASelect.selectedItem as? SessionComboItem)?.id.orEmpty()
-            }
-            s.sessionB = sessionBField.text.trim().ifBlank {
-                (sessionBSelect.selectedItem as? SessionComboItem)?.id.orEmpty()
-            }
+            s.sessionA = sessionComboValue(sessionASelect)
+            s.sessionB = sessionComboValue(sessionBSelect)
             s.autoRelayEnabled = autoRelay.isSelected
             s.stopOnStageDone = stopOnDone.isSelected
         }
@@ -379,8 +374,6 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
             updateSessionDropdowns()
             saveSettings()
         }
-        bindDocChange(sessionAField) { saveSettings() }
-        bindDocChange(sessionBField) { saveSettings() }
 
         sendA.addActionListener {
             val text = messageArea.text
@@ -447,5 +440,12 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
         val content = ContentFactory.getInstance().createContent(panel, "", false)
         toolWindow.contentManager.addContent(content)
         SwingUtilities.invokeLater { messageArea.requestFocusInWindow() }
+    }
+
+    private fun wrapField(label: String, component: JComboBox<SessionComboItem>): JPanel {
+        val panel = JPanel(BorderLayout(0, 4))
+        panel.add(JLabel(label), BorderLayout.NORTH)
+        panel.add(component, BorderLayout.CENTER)
+        return panel
     }
 }

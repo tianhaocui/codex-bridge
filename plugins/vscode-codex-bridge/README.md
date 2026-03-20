@@ -5,7 +5,7 @@
 
 ## 已实现（插件内）
 - Project A 固定为当前 VSCode 打开的 workspace（只读）
-- 可配置 Project B / Session A / Session B
+- 可配置 Project B，以及支持候选建议和手动输入的 Session A / Session B
 - 插件面板内统一对话流
 - 发给 A / 发给 B / 同时发送
 - 自动互发 + 阶段完成自动停止（支持 `{"bridge_stage":"done|continue"}`）

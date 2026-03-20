@@ -4,7 +4,7 @@
 - ToolWindow 内直接使用 Bridge 功能（非外部 App）
 - Project A 固定为当前 IDEA 打开项目路径
 - 从 `~/.codex/config.toml` / `~/.codex/history.jsonl` 自动加载 Project / Session 下拉
-- Project B / Session A / Session B 支持“下拉选择 + 手动输入（手输优先）”
+- Project B 支持“下拉选择 + 手动输入（手输优先）”；Session A / Session B 支持“单一可编辑候选框”
 - 发给 A / 发给 B / 同时发送
 - 自动互发 + 阶段完成自动停止（识别最后一行 JSON 状态）
 - `■` 停止按钮（真实 interrupt），并自动关闭互发
