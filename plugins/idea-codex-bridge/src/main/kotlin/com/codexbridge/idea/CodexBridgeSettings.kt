@@ -10,7 +10,10 @@ import com.intellij.openapi.project.Project
 @State(name = "CodexBridgeSettings", storages = [Storage("codex-bridge.xml")])
 class CodexBridgeSettings : PersistentStateComponent<CodexBridgeSettings.State> {
     data class State(
+        var projectAPath: String = "",
         var projectBPath: String = "",
+        var toolA: String = "codex",
+        var toolB: String = "codex",
         var sessionA: String = "",
         var sessionB: String = "",
         var autoRelayEnabled: Boolean = false,

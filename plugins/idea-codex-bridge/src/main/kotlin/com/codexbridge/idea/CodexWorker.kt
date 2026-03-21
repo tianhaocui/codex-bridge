@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.text.Charsets.UTF_8
 
-class CodexWorker {
+class CodexWorker : BridgeWorker {
     private var process: Process? = null
     private var threadId: String? = null
     private var activeTurnId: String? = null
@@ -23,7 +23,7 @@ class CodexWorker {
     private val nextRequestId = AtomicInteger(1)
     private val pending = ConcurrentHashMap<String, (Map<String, Any?>) -> Unit>()
 
-    fun send(
+    override fun send(
         message: String,
         cwd: String,
         resumeThreadId: String?,
@@ -53,14 +53,14 @@ class CodexWorker {
         }
     }
 
-    fun shutdown() {
+    override fun shutdown() {
         process?.destroy()
         process = null
         synchronized(stderrTail) { stderrTail.clear() }
         pending.clear()
     }
 
-    fun interrupt() {
+    override fun interrupt() {
         val tid = threadId ?: return
         val turnId = activeTurnId ?: return
         ApplicationManager.getApplication().executeOnPooledThread {

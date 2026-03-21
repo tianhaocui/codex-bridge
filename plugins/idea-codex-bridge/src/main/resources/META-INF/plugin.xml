@@ -3,7 +3,7 @@
     <name>Codex Bridge</name>
     <vendor>cuitianhao</vendor>
     <description><![CDATA[
-        Codex Bridge plugin version with in-IDE tool window and fixed Project A from current IDEA project.
+        Codex Bridge IDEA plugin with in-IDE A/B bridge chat, Codex and Claude Code session selection, and current-project aware workflows.
     ]]></description>
 
     <depends>com.intellij.modules.platform</depends>
@@ -11,7 +11,7 @@
     <extensions defaultExtensionNs="com.intellij">
         <notificationGroup id="Codex Bridge" displayType="BALLOON"/>
         <toolWindow id="Codex Bridge"
-                    anchor="right"
+                    anchor="left"
                     factoryClass="com.codexbridge.idea.CodexBridgeToolWindowFactory"
                     canCloseContents="false"/>
     </extensions>
