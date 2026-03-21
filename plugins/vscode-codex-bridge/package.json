@@ -11,20 +11,40 @@
     "Other"
   ],
   "activationEvents": [
-    "onCommand:codexBridge.openWithCurrentProject"
+    "onCommand:codexBridge.openWithCurrentProject",
+    "onView:codexBridge.sidebar"
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codexBridgeSidebar",
+          "title": "Codex Bridge",
+          "icon": "media/bridge.svg"
+        }
+      ]
+    },
+    "views": {
+      "codexBridgeSidebar": [
+        {
+          "id": "codexBridge.sidebar",
+          "name": "Codex Bridge",
+          "type": "webview"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "codexBridge.openWithCurrentProject",
-        "title": "Codex Bridge: Open With Current Project"
+        "title": "Codex Bridge: Focus Sidebar"
       }
     ]
   },
   "scripts": {
     "build": "tsc -p .",
-    "watch": "tsc -p . --watch"
+    "watch": "tsc -p . --watch",
+    "test": "npm run build && node test/bridgeProtocol.test.js && node test/codexExecutable.test.js && node test/webviewSyntax.test.js && node test/remoteConfig.test.js"
   },
   "devDependencies": {
     "@types/node": "^20.14.11",
