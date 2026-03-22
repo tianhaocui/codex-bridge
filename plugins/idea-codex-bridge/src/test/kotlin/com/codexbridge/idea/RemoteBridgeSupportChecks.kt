@@ -38,7 +38,7 @@ object RemoteBridgeSupportChecks {
     private fun checkSnippetParsing() {
         val parsed = RemoteBridgeSupport.parseSnippet(
             """
-            # Codex Bridge Remote 连接配置
+            # Agent Bridge Remote 连接配置
             mode=client
             remoteUrl=http://127.0.0.1:9238
             token=token-123

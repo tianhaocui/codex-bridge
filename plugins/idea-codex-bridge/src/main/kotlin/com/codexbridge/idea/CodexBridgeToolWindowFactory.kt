@@ -433,7 +433,7 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
         remoteUrlField.emptyText.text = "远端 URL，例如 http://192.168.3.110:9238"
         remoteHubUrlField.emptyText.text = "Hub URL，例如 http://bridge-hub.local:9239"
         remotePeerIdField.emptyText.text = "Remote 要连接的目标节点 ID，可手填覆盖下拉"
-        remoteTokenField.emptyText.text = "认证 Token，用于远端 / Hub 鉴权"
+        remoteTokenField.emptyText.text = "访问 Key，用于远端 / Hub 鉴权"
         remoteDeviceNameField.emptyText.text = "当前设备名（主机注册到 Hub 时展示）"
         remoteListenPortField.emptyText.text = RemoteBridgeSupport.DEFAULT_REMOTE_PORT.toString()
         remoteTargetProjectField.emptyText.text = "转发到远端时要使用的项目路径"
@@ -444,7 +444,7 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
         val copyRemoteConfigButton = JButton("复制连接配置")
         val applyRemoteConfigButton = JButton("应用配置")
         val refreshRemotePeersButton = JButton("刷新节点")
-        val remoteConversationStatusLabel = createPillLabel("远程未启用", panelStrong, foreground, cardBorder)
+        val remoteConversationStatusLabel = createPillLabel("跨设备未启用", panelStrong, foreground, cardBorder)
         val remoteConversationLoadingLabel = createPillLabel("就绪", userBubble, foreground, accent)
         val remoteConnectivityDot = createStatusDot()
         val remoteConnectivityLabel = JBLabel("链路状态")
@@ -473,9 +473,9 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
         remoteMessageArea.lineWrap = true
         remoteMessageArea.wrapStyleWord = true
         val remoteMessageScroll = JBScrollPane(remoteMessageArea)
-        val remoteSendAButton = JButton("发到 Remote A")
-        val remoteSendBButton = JButton("发到 Remote B")
-        val remoteSendBothButton = JButton("发到全部 Remote")
+        val remoteSendAButton = JButton("发给本机 AI")
+        val remoteSendBButton = JButton("发给远端 AI")
+        val remoteSendBothButton = JButton("同时发送")
         val interruptRemoteButton = JButton("■")
         val remoteSendHintLabel = JBLabel("")
         remoteSendHintLabel.foreground = muted
@@ -540,14 +540,14 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
         styleButton(refreshRemotePeersButton, buttonSecondary, buttonSecondaryFg)
 
         val bridgeChatTabButton = createTabButton("桥接对话")
-        val remoteTabButton = createTabButton("远程对接")
+        val remoteTabButton = createTabButton("跟我的 AI 说去吧")
 
         fun createNavRail(): JPanel {
-            val title = JBLabel("Codex Bridge")
+            val title = JBLabel("Agent Bridge")
             title.foreground = foreground
             title.font = title.font.deriveFont(Font.BOLD, title.font.size2D + 2f)
 
-            val subtitle = JBLabel("<html><body style='width:100%'>Bridge 与 Remote 共用一个左侧导航，主区域只展示当前页内容。</body></html>")
+            val subtitle = JBLabel("<html><body style='width:100%'>Bridge 与跨设备会话共用一个左侧导航，主区域只展示当前页内容。</body></html>")
             subtitle.foreground = muted
             subtitle.font = subtitle.font.deriveFont(subtitle.font.size2D - 1f)
 
@@ -611,14 +611,16 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
 
         fun currentRemoteConfig(): RemoteWorkerConfig {
             val listenPort = remoteListenPortField.text.trim().toIntOrNull() ?: stored.remoteListenPort
+            val targetProjectPath = remoteTargetProjectField.text.trim()
+            val targetTool = selectedRemoteTargetTool()
             return RemoteWorkerConfig(
                 mode = currentRemoteMode(),
                 url = remoteUrlField.text.trim(),
                 token = RemoteBridgeSupport.normalizeRemoteToken(remoteTokenField.text.trim(), stored.remoteToken),
                 hubUrl = remoteHubUrlField.text.trim(),
                 peerId = selectedRemotePeerId(),
-                targetTool = selectedRemoteTargetTool(),
-                targetProjectPath = remoteTargetProjectField.text.trim(),
+                targetTool = targetTool,
+                targetProjectPath = targetProjectPath,
                 targetSessionId = remoteTargetSessionField.text.trim()
             ).also {
                 if (listenPort in 1..65535) {
@@ -676,11 +678,9 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
             }
             if (matched) return value
 
-            return when (tool) {
-                BridgeCliTool.CLAUDE -> value.takeIf { Regex("^(urn:uuid:)?[0-9a-fA-F-]{36}$").matches(it) }.orEmpty()
-                BridgeCliTool.CODEX -> value.takeIf { Regex("^(urn:uuid:)?[0-9a-fA-F-]{8,}$").matches(it) }.orEmpty()
-                BridgeCliTool.REMOTE -> ""
-            }
+            return value.takeIf {
+                Regex("^(urn:uuid:)?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$").matches(it)
+            }.orEmpty()
         }
 
         fun selectedSessionId(side: String): String {
@@ -928,7 +928,7 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
                 RemoteConnectivity.CHECKING -> "检查中"
                 RemoteConnectivity.IDLE -> "未启用"
             }
-            if (mode == RemoteMode.OFF) return "远程未启用"
+            if (mode == RemoteMode.OFF) return "跨设备未启用"
             if (mode == RemoteMode.HOST) {
                 return "Host 导出 ${selectedRemoteExportSide()} · $connectivityText" +
                     if (remoteAutoRelay.isSelected) " · 自动接力开" else ""
@@ -1123,7 +1123,11 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
             val exportSessionId = selectedRemoteShareSessionId()
             val targetTool = if (isHost) exportTool else selectedRemoteTargetTool()
             val targetProjectPath = if (isHost) exportProjectPath else remoteTargetProjectField.text.trim()
-            val targetSessionId = if (isHost) exportSessionId else remoteTargetSessionField.text.trim()
+            val targetSessionId = if (isHost) {
+                exportSessionId
+            } else {
+                normalizeResumeId(targetTool, remoteTargetSessionField.text.trim(), targetProjectPath)
+            }
             val targetLabel = if (isHost) {
                 listOf(
                     remoteDeviceNameField.text.trim().ifBlank { localDeviceName() },
@@ -1163,8 +1167,19 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
             if (remoteTargetLabelText.isNotBlank()) return remoteTargetLabelText
             val tool = selectedRemoteTargetTool().label
             val projectPath = remoteTargetProjectField.text.trim().ifBlank { "(未指定项目)" }
-            val sessionId = remoteTargetSessionField.text.trim().ifBlank { "new-session" }
+            val sessionId = normalizeResumeId(selectedRemoteTargetTool(), remoteTargetSessionField.text.trim(), remoteTargetProjectField.text.trim())
+                .ifBlank { "new-session" }
             return listOf(tool, projectPath, sessionId).joinToString(" | ")
+        }
+
+        fun shouldRetryWithoutSession(tool: BridgeCliTool, resumeId: String?, message: String): Boolean {
+            if (tool == BridgeCliTool.REMOTE || resumeId.isNullOrBlank()) return false
+            val normalized = message.lowercase()
+            return normalized.contains("thread/resume")
+                || normalized.contains("initialize 超时")
+                || normalized.contains("invalid thread id")
+                || normalized.contains("no conversation found with session id")
+                || normalized.contains("session not found")
         }
 
         var updateStatus: () -> Unit = {}
@@ -1300,29 +1315,38 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
                     )
                     setSending(side, true)
                     val handle = appendAssistant(side, ChatChannel.REMOTE, ChatPeer.LOCAL)
-                    worker.send(
-                        composeMessage(payload.text, ChatChannel.REMOTE),
-                        projectPath,
-                        sessionId.ifBlank { null },
-                        onDelta = { delta ->
-                            updateBubble(handle, delta)
-                            payload.onDelta(delta)
-                        },
-                        onDone = { result ->
-                            setSending(side, false)
-                            result
-                                .onSuccess { reply ->
-                                    updateBubble(handle, "", reply)
-                                    payload.onDone(reply)
-                                    future.complete(Result.success(reply))
-                                }
-                                .onFailure { error ->
-                                    updateBubble(handle, "", error.message ?: "(空回复)")
-                                    appendSystem("远端请求执行失败：${error.message}", side, ChatChannel.REMOTE)
-                                    future.complete(Result.failure(error))
-                                }
-                        }
-                    )
+                    fun runAttempt(resumeId: String?, allowRetryWithoutSession: Boolean) {
+                        worker.send(
+                            composeMessage(payload.text, ChatChannel.REMOTE),
+                            projectPath,
+                            resumeId,
+                            onDelta = { delta ->
+                                updateBubble(handle, delta)
+                                payload.onDelta(delta)
+                            },
+                            onDone = onRemoteDone@{ result ->
+                                result
+                                    .onSuccess { reply ->
+                                        setSending(side, false)
+                                        updateBubble(handle, "", reply)
+                                        payload.onDone(reply)
+                                        future.complete(Result.success(reply))
+                                    }
+                                    .onFailure { error ->
+                                        if (allowRetryWithoutSession && shouldRetryWithoutSession(targetTool, resumeId, error.message.orEmpty())) {
+                                            appendSystem("远端最近会话恢复失败，已自动切换为新会话重试", side, ChatChannel.REMOTE)
+                                            runAttempt(null, false)
+                                            return@onRemoteDone
+                                        }
+                                        setSending(side, false)
+                                        updateBubble(handle, "", error.message ?: "(空回复)")
+                                        appendSystem("远端请求执行失败：${error.message}", side, ChatChannel.REMOTE)
+                                        future.complete(Result.failure(error))
+                                    }
+                            }
+                        )
+                    }
+                    runAttempt(sessionId.ifBlank { null }, sessionId.isNotBlank())
                     future
                 }
             },
@@ -1344,11 +1368,12 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
                     "${hubUrl.removeSuffix("/")}/register",
                     JsonUtil.stringify(
                         mapOf(
-                            "token" to token,
                             "nodeId" to localRemoteNodeId,
                             "deviceName" to remoteDeviceNameField.text.trim().ifBlank { localDeviceName() },
                             "invokeUrl" to "${invokeBaseUrl.removeSuffix("/")}/invoke",
-                            "exportSide" to selectedRemoteExportSide()
+                            "accessToken" to token,
+                            "exportSide" to selectedRemoteExportSide(),
+                            "discoverable" to true
                         )
                     ),
                     mapOf("Content-Type" to "application/json")
@@ -1364,7 +1389,7 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
             runCatching {
                 RemoteHttpUtil.post(
                     "${hubUrl.removeSuffix("/")}/unregister",
-                    JsonUtil.stringify(mapOf("token" to token, "nodeId" to localRemoteNodeId)),
+                    JsonUtil.stringify(mapOf("accessToken" to token, "nodeId" to localRemoteNodeId)),
                     mapOf("Content-Type" to "application/json")
                 )
             }
@@ -1372,14 +1397,13 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
 
         fun refreshHubPeers() {
             val hubUrl = remoteHubUrlField.text.trim()
-            val token = remoteTokenField.text.trim()
-            if (hubUrl.isBlank() || token.isBlank()) {
+            if (hubUrl.isBlank()) {
                 remotePeerOptions = emptyList()
                 return
             }
             val response = runCatching {
                 RemoteHttpUtil.get(
-                    "${hubUrl.removeSuffix("/")}/peers?token=${java.net.URLEncoder.encode(token, "UTF-8")}&selfId=${java.net.URLEncoder.encode(localRemoteNodeId, "UTF-8")}"
+                    "${hubUrl.removeSuffix("/")}/peers?selfId=${java.net.URLEncoder.encode(localRemoteNodeId, "UTF-8")}"
                 )
             }.getOrElse {
                 remotePeerOptions = emptyList()
@@ -1467,19 +1491,19 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
             }
 
             values["mode"]?.let { remoteModeSelect.selectedItem = RemoteMode.fromValue(it) }
-            values["remoteUrl"]?.let { remoteUrlField.text = it }
-            values["hubUrl"]?.let { remoteHubUrlField.text = it }
+            remoteUrlField.text = values["remoteUrl"].orEmpty()
+            remoteHubUrlField.text = values["hubUrl"].orEmpty()
+            remotePeerIdField.text = values["peerId"].orEmpty()
             values["peerId"]?.let {
-                remotePeerIdField.text = it
                 if (remotePeerOptions.none { option -> option.id == it }) {
                     remotePeerSelect.selectedIndex = 0
                 }
             }
             values["token"]?.let { remoteTokenField.text = RemoteBridgeSupport.normalizeRemoteToken(it, stored.remoteToken) }
             values["targetTool"]?.let { remoteTargetToolSelect.selectedItem = BridgeCliTool.fromRemoteTarget(it) }
-            values["targetProjectPath"]?.let { remoteTargetProjectField.text = it }
-            values["targetSessionId"]?.let { remoteTargetSessionField.text = it }
-            values["targetLabel"]?.let { remoteTargetLabelText = it }
+            remoteTargetProjectField.text = values["targetProjectPath"].orEmpty()
+            remoteTargetSessionField.text = values["targetSessionId"].orEmpty()
+            remoteTargetLabelText = values["targetLabel"].orEmpty()
 
             if (selectedTool("A") != BridgeCliTool.REMOTE && selectedTool("B") != BridgeCliTool.REMOTE) {
                 val targetSide = pickRemoteImportSide()
@@ -1619,64 +1643,80 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
 
             setSending(side, true)
             val assistantHandle = appendAssistant(side, channel, assistantPeer)
-            worker.send(
-                composeMessage(text, channel),
-                projectPath,
-                sessionId.ifBlank { null },
-                onDelta = { delta -> updateBubble(assistantHandle, delta) },
-                onDone = { result ->
-                    setSending(side, false)
-                    result
-                        .onSuccess { reply ->
-                            updateBubble(assistantHandle, "", reply)
-                            if (channel == ChatChannel.REMOTE) {
-                                if (remoteAutoRelay.isSelected && stopOnDone.isSelected && stageDone(reply)) {
-                                    ApplicationManager.getApplication().invokeLater {
-                                        remoteAutoRelay.isSelected = false
-                                        saveSettings()
-                                        updateStatus()
+            fun runAttempt(resumeId: String?, allowRetryWithoutSession: Boolean) {
+                worker.send(
+                    composeMessage(text, channel),
+                    projectPath,
+                    resumeId,
+                    onDelta = { delta -> updateBubble(assistantHandle, delta) },
+                    onDone = onLocalDone@{ result ->
+                        result
+                            .onSuccess { reply ->
+                                setSending(side, false)
+                                updateBubble(assistantHandle, "", reply)
+                                if (channel == ChatChannel.REMOTE) {
+                                    if (remoteAutoRelay.isSelected && stopOnDone.isSelected && stageDone(reply)) {
+                                        ApplicationManager.getApplication().invokeLater {
+                                            remoteAutoRelay.isSelected = false
+                                            saveSettings()
+                                            updateStatus()
+                                        }
+                                        appendSystem("检测到阶段完成，已停止跨设备自动接力", side, ChatChannel.REMOTE)
+                                        return@onSuccess
                                     }
-                                    appendSystem("检测到阶段完成，已停止跨设备自动接力", side, ChatChannel.REMOTE)
-                                    return@onSuccess
-                                }
-                                if (remoteAutoRelay.isSelected) {
-                                    val payload = relayPayload(reply)
-                                    val relayTarget = nextRemoteRelayTarget(side)
-                                    if (payload.isNotBlank() && relayTarget != null) {
-                                        sendTo(
-                                            relayTarget.side,
-                                            payload,
-                                            true,
-                                            ChatChannel.REMOTE,
-                                            relayTarget.userPeer,
-                                            relayTarget.assistantPeer
-                                        )
+                                    if (remoteAutoRelay.isSelected) {
+                                        val payload = relayPayload(reply)
+                                        val relayTarget = nextRemoteRelayTarget(side)
+                                        if (payload.isNotBlank() && relayTarget != null) {
+                                            sendTo(
+                                                relayTarget.side,
+                                                payload,
+                                                true,
+                                                ChatChannel.REMOTE,
+                                                relayTarget.userPeer,
+                                                relayTarget.assistantPeer
+                                            )
+                                        }
                                     }
-                                }
-                            } else {
-                                if (autoRelay.isSelected && stopOnDone.isSelected && stageDone(reply)) {
-                                    ApplicationManager.getApplication().invokeLater {
-                                        autoRelay.isSelected = false
-                                        saveSettings()
-                                        updateStatus()
+                                } else {
+                                    if (autoRelay.isSelected && stopOnDone.isSelected && stageDone(reply)) {
+                                        ApplicationManager.getApplication().invokeLater {
+                                            autoRelay.isSelected = false
+                                            saveSettings()
+                                            updateStatus()
+                                        }
+                                        appendSystem("检测到阶段完成，已停止自动互发")
+                                        return@onSuccess
                                     }
-                                    appendSystem("检测到阶段完成，已停止自动互发")
-                                    return@onSuccess
-                                }
-                                if (autoRelay.isSelected) {
-                                    val payload = relayPayload(reply)
-                                    if (payload.isNotBlank()) {
-                                        sendTo(if (side == "A") "B" else "A", payload, true, ChatChannel.BRIDGE)
+                                    if (autoRelay.isSelected) {
+                                        val payload = relayPayload(reply)
+                                        if (payload.isNotBlank()) {
+                                            sendTo(if (side == "A") "B" else "A", payload, true, ChatChannel.BRIDGE)
+                                        }
                                     }
                                 }
                             }
-                        }
-                        .onFailure { error ->
-                            updateBubble(assistantHandle, "", error.message ?: "(空回复)")
-                            appendSystem("$side 执行失败：${error.message}", side, channel)
-                        }
-                }
-            )
+                            .onFailure { error ->
+                                if (allowRetryWithoutSession && shouldRetryWithoutSession(tool, resumeId, error.message.orEmpty())) {
+                                    if (side == "A") {
+                                        sessionAField.text = ""
+                                        sessionASelect.selectedIndex = 0
+                                    } else {
+                                        sessionBField.text = ""
+                                        sessionBSelect.selectedIndex = 0
+                                    }
+                                    appendSystem("$side 最近会话恢复失败，已自动切换为新会话重试", side, channel)
+                                    runAttempt(null, false)
+                                    return@onLocalDone
+                                }
+                                setSending(side, false)
+                                updateBubble(assistantHandle, "", error.message ?: "(空回复)")
+                                appendSystem("$side 执行失败：${error.message}", side, channel)
+                            }
+                    }
+                )
+            }
+            runAttempt(sessionId.ifBlank { null }, sessionId.isNotBlank() && tool != BridgeCliTool.REMOTE)
         }
 
         fun handleBridgeInterrupt() {
@@ -1800,7 +1840,7 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
             )
         )
         addSectionGap(bridgeConfigContent)
-        bridgeConfigContent.add(createSectionHeader("执行策略", "本地桥接适合单机 A/B 协作；跨设备 Remote 的自动接力单独放在远程对接页。"))
+        bridgeConfigContent.add(createSectionHeader("执行策略", "本地桥接适合单机 A/B 协作；跨设备 Remote 的自动接力单独放在“跟我的 AI 说去吧”页。"))
         addSectionGap(bridgeConfigContent)
         bridgeConfigContent.add(
             row(
@@ -1883,7 +1923,7 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
 
         val remoteHeroCard = createPageHero(
             "REMOTE CONVERSATION",
-            "远程对接",
+            "跟我的 AI 说去吧",
             "把本机 AI 与其他设备上的 AI 拉进同一条对话流。支持直连、Hub 注册发现、配置片段复制粘贴和远端 AI 自动接力。",
             createPillLabel("Remote / Hub", userBubble, foreground, accent),
             createPillLabel("复制配置一键接入", panelStrong, muted, cardBorder),
@@ -1923,7 +1963,7 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
         pasteScroll.viewport.background = panelStrong
 
         val remoteModeSectionContent = createVerticalContent()
-        remoteModeSectionContent.add(JBLabel("<html><body style='width:100%'>远程对接的目标不是单向操作，而是把“本机 AI”和“其他设备 AI”拉进同一条对话流里，所以配置区默认折叠。</body></html>").apply {
+        remoteModeSectionContent.add(JBLabel("<html><body style='width:100%'>这里的目标不是单向操作，而是把“本机 AI”和“其他设备 AI”拉进同一条对话流里，所以配置区默认折叠。</body></html>").apply {
             this.foreground = muted
             this.font = this.font.deriveFont(this.font.size2D - 1f)
             alignmentX = Component.LEFT_ALIGNMENT
@@ -1949,7 +1989,7 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
         val remoteLinkSectionContent = createVerticalContent()
         remoteLinkSectionContent.add(remoteStatusCard)
         addSectionGap(remoteLinkSectionContent)
-        remoteLinkSectionContent.add(createMiniCard("认证 Token", remoteTokenField, "直连和 Hub 都使用同一个 Token"))
+        remoteLinkSectionContent.add(createMiniCard("访问 Key", remoteTokenField, "直连时与对方主机保持一致；Hub 模式下填写目标节点导出的访问 Key"))
         addSectionGap(remoteLinkSectionContent)
         val remoteLinkActionRow = JPanel(FlowLayout(FlowLayout.LEFT, 8, 0))
         remoteLinkActionRow.isOpaque = false
@@ -2009,7 +2049,7 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
         remoteLinkSectionContent.add(remoteAdvancedSectionCard)
         val remoteLinkSectionCard = createCollapsibleCard(
             "远端链路",
-            "认证、节点发现、直连地址和 Hub 信息。",
+            "访问 Key、节点发现、直连地址和 Hub 信息。",
             remoteLinkSectionContent,
             "Link",
             true
@@ -2054,7 +2094,7 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
         remoteImportSectionContent.add(createMiniCard("粘贴配置", pasteScroll, "把别人发给你的连接配置粘贴到这里，然后点“应用配置”"))
         val remoteImportSectionCard = createCollapsibleCard(
             "粘贴连接配置",
-            "推荐优先使用。粘贴后会自动补全远端地址、Token 和目标线程。",
+            "推荐优先使用。粘贴后会自动补全远端地址、访问 Key 和目标线程。",
             remoteImportSectionContent,
             "Client",
             false
@@ -2068,7 +2108,7 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
         remoteConfigContent.add(remoteRelayToggleCard)
 
         val remoteConfigCard = createCollapsibleCard(
-            "跨设备桥接设置",
+            "跨设备会话设置",
             "远端对接不是单向控制，而是把本机 AI 和其他设备 AI 放进同一条对话流，所以设置区默认折叠。",
             remoteConfigContent,
             "Remote 点击展开",
@@ -2078,10 +2118,10 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
             saveSettings()
         }
 
-        val remoteConversationCard = createCard("远端对话流", "统一查看 Local / Remote / System 消息，专门用于跨设备 AI 协作。")
+        val remoteConversationCard = createCard("跨设备对话流", "统一查看 Local / Remote / System 消息，专门用于跨设备 AI 协作。")
         val remoteConversationTop = JPanel(FlowLayout(FlowLayout.LEFT, 8, 0))
         remoteConversationTop.isOpaque = false
-        remoteConversationTop.add(createPillLabel("Remote Chat", userBubble, foreground, accent))
+        remoteConversationTop.add(createPillLabel("Local / Remote", userBubble, foreground, accent))
         remoteConversationTop.add(remoteConversationStatusLabel)
         remoteConversationTop.add(remoteConversationLoadingLabel)
         val remoteConversationContent = JPanel(BorderLayout(0, 10))
@@ -2090,7 +2130,7 @@ class CodexBridgeToolWindowFactory : ToolWindowFactory {
         remoteConversationContent.add(remoteSurface.container, BorderLayout.CENTER)
         remoteConversationCard.add(remoteConversationContent, BorderLayout.CENTER)
 
-        val remoteComposerCard = createCard("远端输入", "用于把消息注入远端链路。Enter 会发到默认目标，Shift+Enter 换行。")
+        val remoteComposerCard = createCard("注入消息", "用于把消息注入跨设备对话流。Enter 会发到默认目标，Shift+Enter 换行。")
         val remoteButtons = JPanel(FlowLayout(FlowLayout.LEFT, 8, 0))
         remoteButtons.isOpaque = false
         remoteButtons.add(remoteSendAButton)

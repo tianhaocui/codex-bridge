@@ -1,16 +1,16 @@
 <idea-plugin>
     <id>com.codexbridge.idea</id>
-    <name>Codex Bridge</name>
+    <name>Agent Bridge</name>
     <vendor>cuitianhao</vendor>
     <description><![CDATA[
-        Codex Bridge IDEA plugin with in-IDE A/B bridge chat, Codex / Claude / Remote selection, and cross-device Remote/Hub workflows.
+        Agent Bridge IDEA plugin with in-IDE A/B bridge chat, Codex / Claude / Remote selection, and cross-device Remote/Hub workflows.
     ]]></description>
 
     <depends>com.intellij.modules.platform</depends>
 
     <extensions defaultExtensionNs="com.intellij">
-        <notificationGroup id="Codex Bridge" displayType="BALLOON"/>
-        <toolWindow id="Codex Bridge"
+        <notificationGroup id="Agent Bridge" displayType="BALLOON"/>
+        <toolWindow id="Agent Bridge"
                     anchor="left"
                     factoryClass="com.codexbridge.idea.CodexBridgeToolWindowFactory"
                     canCloseContents="false"/>
@@ -20,10 +20,10 @@
         <action
                 id="CodexBridge.OpenWithCurrentProject"
                 class="com.codexbridge.idea.OpenCodexBridgeAction"
-                text="Open Codex Bridge Tool Window"
-                description="Open Codex Bridge tool window"/>
+                text="Open Agent Bridge Tool Window"
+                description="Open Agent Bridge tool window"/>
 
-        <group id="CodexBridge.Group" text="Codex Bridge" popup="true">
+        <group id="CodexBridge.Group" text="Agent Bridge" popup="true">
             <add-to-group group-id="ToolsMenu" anchor="last"/>
             <action id="CodexBridge.OpenWithCurrentProject.Ref"
                     class="com.codexbridge.idea.OpenCodexBridgeAction"

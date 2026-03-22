@@ -1,1 +1,1 @@
-rootProject.name = "idea-codex-bridge"
+rootProject.name = "idea-agent-bridge"
