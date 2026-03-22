@@ -1,7 +1,7 @@
 # Codex Bridge
 
 Codex Bridge 是一个面向跨项目协作调试的桥接工具集。  
-它把两个 Codex 会话（A/B）放到同一视图中，支持手动或自动互发，帮助你在两个项目、两个上下文之间快速协同。
+它把两个 AI 会话（A/B）放到同一视图中，支持 `Codex`、`Claude Code` 与 `Remote` 组合，既能做本机双侧协作，也能把另一台设备上的 AI 拉进同一条对话流。
 
 当前包含三个版本：
 - `macOS App`（SwiftUI 桌面应用）
@@ -20,13 +20,17 @@ Codex Bridge 的目标是把这些动作整合到一条协作流里。
 ## 核心能力
 
 - 双侧会话：`发给A` / `发给B` / `同时发送`
+- 双侧工具切换：A / B 都可选择 `Codex`、`Claude Code` 或 `Remote`
 - 自动互发：A 回复可自动转发给 B（反之亦然）
 - 阶段完成约束：支持单行 JSON 协议识别  
   - `{"bridge_stage":"continue"}`
   - `{"bridge_stage":"done"}`
 - 实时状态：显示 A/B 是否忙碌、生成中动画、可一键打断
-- 会话复用：按 `session_id` 续接历史会话
-- 项目/会话下拉：自动读取本机 Codex 配置与历史进行筛选
+- 会话复用：按 `session_id` / thread id 续接历史会话
+- 项目/会话下拉：自动读取本机 Codex / Claude Code 配置与历史进行筛选
+- 跨设备对话：支持局域网直连或 Hub 注册/发现/转发
+- 远端配置分享：复制配置时可带上目标 CLI、项目路径与线程 ID，对端粘贴后直接接入
+- 输入法兼容：中文输入法有候选词时回车用于上屏，无候选词时回车发送
 
 ## 仓库结构
 
@@ -67,9 +71,10 @@ open /Users/wulingren/codex-bridge-macapp/Package.swift
 cd /Users/wulingren/codex-bridge-macapp/plugins/vscode-codex-bridge
 npm install
 npm run build
+npx @vscode/vsce package --no-dependencies
 ```
 
-在 VSCode 中使用 `Install from VSIX` 安装打包产物（如需发布请用 `vsce package`）。
+在 VSCode 中使用 `Install from VSIX` 安装打包产物，然后从左侧活动栏打开 `Codex Bridge`。
 
 ### 3) IDEA 插件
 
@@ -99,6 +104,9 @@ GRADLE_USER_HOME=.gradle-home ./.tooling/gradle-8.10.2/bin/gradle clean buildPlu
 
 - 会话下拉为空：  
   检查 `~/.codex/config.toml` 与 `~/.codex/history.jsonl` 是否存在且有有效记录。
+
+- 远端侧提示“项目路径为空”：  
+  通常是本机侧与 `Remote` 侧分配错位，或远端目标项目路径没有带过去。新版 VSCode 插件支持在“远端目标”里直接指定远端项目路径与线程，并在复制连接配置时带出这些信息。
 
 ## 许可证
 

@@ -1,9 +1,21 @@
 {
-  "name": "codex-bridge-launcher",
-  "displayName": "Codex Bridge",
-  "description": "Requires pre-configured codex. Built for cross-project collaboration and joint debugging in VSCode with bridged A/B sessions.",
+  "name": "agent-bridge",
+  "displayName": "Agent Bridge",
+  "description": "Bridge Codex, Claude Code, and remote AI agents in one sidebar with A/B sessions, streaming relay, and cross-device conversations.",
   "version": "0.1.1",
   "publisher": "tianhao",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tianhaocui/codex-bridge.git"
+  },
+  "files": [
+    "out/**/*.js",
+    "media/**",
+    "readme.md",
+    "LICENSE.md",
+    "package.json"
+  ],
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -11,21 +23,40 @@
     "Other"
   ],
   "activationEvents": [
-    "onCommand:codexBridge.openWithCurrentProject"
+    "onCommand:codexBridge.openWithCurrentProject",
+    "onView:codexBridge.sidebar"
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codexBridgeSidebar",
+          "title": "Agent Bridge",
+          "icon": "media/bridge.svg"
+        }
+      ]
+    },
+    "views": {
+      "codexBridgeSidebar": [
+        {
+          "id": "codexBridge.sidebar",
+          "name": "Agent Bridge",
+          "type": "webview"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "codexBridge.openWithCurrentProject",
-        "title": "Codex Bridge: Open With Current Project"
+        "title": "Agent Bridge: Focus Sidebar"
       }
     ]
   },
   "scripts": {
     "build": "tsc -p .",
     "watch": "tsc -p . --watch",
-    "test": "npm run build && node test/bridgeProtocol.test.js && node test/codexExecutable.test.js"
+    "test": "npm run build && node test/bridgeProtocol.test.js && node test/codexExecutable.test.js && node test/claudeExecutable.test.js && node test/claudeWorker.test.js && node test/webviewSyntax.test.js && node test/claudeProjectOptions.test.js && node test/remoteConfig.test.js"
   },
   "devDependencies": {
     "@types/node": "^20.14.11",
