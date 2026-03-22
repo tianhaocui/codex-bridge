@@ -110,7 +110,7 @@ async function main() {
   const target = startMockTargetServer();
   await target.start();
 
-  const hub = spawn('node', ['/Users/wulingren/codex-bridge-macapp/scripts/bridge-hub.mjs', '--port', String(HUB_PORT), '--token', HUB_TOKEN, '--ttl', '2000'], {
+  const hub = spawn('node', ['/Users/wulingren/codex-bridge-macapp/scripts/bridge-hub.mjs', '--port', String(HUB_PORT), '--ttl', '2000'], {
     stdio: ['ignore', 'pipe', 'pipe']
   });
 
@@ -126,16 +126,16 @@ async function main() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        token: HUB_TOKEN,
         nodeId: 'node-a',
         deviceName: 'Test Device A',
         invokeUrl: `http://127.0.0.1:${TARGET_PORT}/invoke`,
+        accessToken: HUB_TOKEN,
         exportSide: 'A'
       })
     });
     assert.equal(registerResponse.status, 200);
 
-    const peersResponse = await fetch(`http://127.0.0.1:${HUB_PORT}/peers?token=${encodeURIComponent(HUB_TOKEN)}`);
+    const peersResponse = await fetch(`http://127.0.0.1:${HUB_PORT}/peers`);
     const peersPayload = await peersResponse.json();
     assert.equal(peersPayload.ok, true);
     assert.equal(peersPayload.peers.length, 1);
@@ -154,7 +154,8 @@ async function main() {
         stream: true,
         targetTool: 'claude',
         targetProjectPath: '/tmp/demo-project',
-        targetSessionId: 'session-123'
+        targetSessionId: 'session-123',
+        sourceNodeId: 'client-node'
       })
     });
     assert.equal(relayResponse.status, 200);
@@ -170,6 +171,7 @@ async function main() {
     assert.equal(target.state.invokeCalls[0].targetTool, 'claude');
     assert.equal(target.state.invokeCalls[0].targetProjectPath, '/tmp/demo-project');
     assert.equal(target.state.invokeCalls[0].targetSessionId, 'session-123');
+    assert.equal(target.state.invokeCalls[0].sourceNodeId, 'client-node');
 
     const interruptResponse = await fetch(`http://127.0.0.1:${HUB_PORT}/relay/interrupt`, {
       method: 'POST',
@@ -187,13 +189,13 @@ async function main() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        token: HUB_TOKEN,
-        nodeId: 'node-a'
+        nodeId: 'node-a',
+        accessToken: HUB_TOKEN
       })
     });
     assert.equal(unregisterResponse.status, 200);
 
-    const peersAfterUnregister = await fetch(`http://127.0.0.1:${HUB_PORT}/peers?token=${encodeURIComponent(HUB_TOKEN)}`);
+    const peersAfterUnregister = await fetch(`http://127.0.0.1:${HUB_PORT}/peers`);
     const peersAfterPayload = await peersAfterUnregister.json();
     assert.equal(peersAfterPayload.peers.length, 0);
 
@@ -201,16 +203,32 @@ async function main() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        token: HUB_TOKEN,
         nodeId: 'node-b',
         deviceName: 'TTL Device',
         invokeUrl: `http://127.0.0.1:${TARGET_PORT}/invoke`,
+        accessToken: HUB_TOKEN,
         exportSide: 'B'
       })
     });
     assert.equal(ttlRegister.status, 200);
+    const hiddenRegister = await fetch(`http://127.0.0.1:${HUB_PORT}/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        nodeId: 'node-hidden',
+        deviceName: 'Hidden Device',
+        invokeUrl: `http://127.0.0.1:${TARGET_PORT}/invoke`,
+        accessToken: HUB_TOKEN,
+        exportSide: 'A',
+        discoverable: false
+      })
+    });
+    assert.equal(hiddenRegister.status, 200);
+    const peersAfterHidden = await fetch(`http://127.0.0.1:${HUB_PORT}/peers`);
+    const peersAfterHiddenPayload = await peersAfterHidden.json();
+    assert.equal(peersAfterHiddenPayload.peers.some((peer) => peer.nodeId === 'node-hidden'), false);
     await sleep(2600);
-    const peersAfterTtl = await fetch(`http://127.0.0.1:${HUB_PORT}/peers?token=${encodeURIComponent(HUB_TOKEN)}`);
+    const peersAfterTtl = await fetch(`http://127.0.0.1:${HUB_PORT}/peers`);
     const peersAfterTtlPayload = await peersAfterTtl.json();
     assert.equal(peersAfterTtlPayload.peers.length, 0);
 

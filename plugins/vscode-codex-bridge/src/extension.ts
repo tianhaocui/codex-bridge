@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
+import { ChildProcessWithoutNullStreams, spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import * as http from 'node:http';
 import * as os from 'node:os';
@@ -11,11 +11,13 @@ import {
   isStageDone,
   sanitizedRelayPayload
 } from './core/bridgeProtocol';
+import { resolveClaudeExecutable } from './core/claudeExecutable';
 import { resolveCodexExecutable } from './core/codexExecutable';
 
 type Side = 'A' | 'B';
 type Role = 'user' | 'assistant' | 'system';
 type CliTool = 'codex' | 'claude' | 'remote';
+type LocalCliTool = 'codex' | 'claude';
 type RemoteMode = 'off' | 'host' | 'client';
 type ChatChannel = 'bridge' | 'remote';
 type ChatPeer = 'local' | 'remote';
@@ -64,14 +66,19 @@ type BridgeState = {
   remotePeerId: string;
   remoteDeviceName: string;
   remotePeerOptions: Array<{ id: string; label: string }>;
+  remotePeerLinked: boolean;
   remoteConnectionSnippet: string;
   remoteConnectivity: 'idle' | 'ok' | 'error' | 'checking';
   remoteTokenHint: string;
-  remoteTargetTool: CliTool;
+  remoteTargetTool: LocalCliTool;
   remoteTargetProjectPath: string;
   remoteTargetSessionId: string;
   remoteTargetLabel: string;
   remoteAutoRelayEnabled: boolean;
+  availableHostTools: LocalCliTool[];
+  remoteHostTool: LocalCliTool;
+  remoteHostProjectPath: string;
+  remoteHostSessionId: string;
 };
 
 type PendingTurn = {
@@ -109,9 +116,11 @@ class RemoteInvokeServer {
       text: string;
       onDelta: (delta: string) => void;
       onDone: (text: string) => void;
-      targetTool?: CliTool;
+      targetTool?: LocalCliTool;
       targetProjectPath?: string;
       targetSessionId?: string;
+      sourceInterruptUrl?: string;
+      sourceNodeId?: string;
     }) => Promise<{ ok: true; text: string } | { ok: false; message: string }>,
     private readonly onInterrupt: () => Promise<void>
   ) {}
@@ -193,6 +202,8 @@ class RemoteInvokeServer {
               targetTool: payload.targetTool,
               targetProjectPath: payload.targetProjectPath,
               targetSessionId: payload.targetSessionId,
+              sourceInterruptUrl: typeof payload.sourceInterruptUrl === 'string' ? payload.sourceInterruptUrl : undefined,
+              sourceNodeId: typeof payload.sourceNodeId === 'string' ? payload.sourceNodeId : undefined,
               onDelta: (delta) => {
                 if (!delta || finished) return;
                 aggregate += delta;
@@ -257,9 +268,11 @@ class RemoteWorker implements BridgeWorker {
       token: string;
       hubUrl: string;
       peerId: string;
-      targetTool: CliTool;
+      targetTool: LocalCliTool;
       targetProjectPath: string;
       targetSessionId: string;
+      sourceInterruptUrl?: string;
+      sourceNodeId?: string;
     }
   ) {}
 
@@ -302,11 +315,12 @@ class RemoteWorker implements BridgeWorker {
               stream: true,
               targetTool: config.targetTool,
               targetProjectPath: config.targetProjectPath,
-              targetSessionId: config.targetSessionId
+              targetSessionId: config.targetSessionId,
+              sourceNodeId: config.sourceNodeId
             })
           }
         : {
-            url: this.resolveInvokeUrl(rawUrl),
+            url: RemoteWorker.resolveInvokeUrl(rawUrl),
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               token,
@@ -314,7 +328,8 @@ class RemoteWorker implements BridgeWorker {
               stream: true,
               targetTool: config.targetTool,
               targetProjectPath: config.targetProjectPath,
-              targetSessionId: config.targetSessionId
+              targetSessionId: config.targetSessionId,
+              sourceInterruptUrl: config.sourceInterruptUrl
             })
           };
       const response = await fetch(request.url, {
@@ -329,7 +344,7 @@ class RemoteWorker implements BridgeWorker {
         onDone({ ok: false, message: text || `远端调用失败 (${response.status})` });
         return;
       }
-      await this.consumeRemoteResponse(response, onDelta, onDone);
+      await RemoteWorker.consumeStreamingResponse(response, onDelta, onDone);
       this.abortController = null;
     } catch (err: any) {
       this.abortController = null;
@@ -348,7 +363,7 @@ class RemoteWorker implements BridgeWorker {
     const directUrl = config.url.trim();
     const interruptUrl = hubUrl && peerId
       ? `${hubUrl.replace(/\/$/, '')}/relay/interrupt`
-      : this.resolveInterruptUrl(directUrl);
+      : RemoteWorker.resolveInterruptUrl(directUrl);
     const body = hubUrl && peerId ? JSON.stringify({ token: config.token.trim(), targetNodeId: peerId }) : undefined;
     fetch(interruptUrl, {
       method: 'POST',
@@ -361,7 +376,7 @@ class RemoteWorker implements BridgeWorker {
 
   shutdown(): void {}
 
-  private async consumeRemoteResponse(
+  static async consumeStreamingResponse(
     response: Response,
     onDelta: (chunk: string) => void,
     onDone: (result: { ok: true; text: string } | { ok: false; message: string }) => void
@@ -380,7 +395,7 @@ class RemoteWorker implements BridgeWorker {
     const reader = response.body.getReader();
 
     const handleJsonObject = (payload: any): boolean => {
-      const parsed = this.extractStreamingPayload(payload);
+      const parsed = RemoteWorker.extractStreamingPayload(payload);
       if (parsed.type === 'delta') {
         aggregate += parsed.text;
         onDelta(parsed.text);
@@ -455,7 +470,7 @@ class RemoteWorker implements BridgeWorker {
     if (contentType.includes('application/json') && aggregate.trim() === '') {
       try {
         const parsed = JSON.parse(tail || '{}');
-        const result = this.extractStreamingPayload(parsed);
+        const result = RemoteWorker.extractStreamingPayload(parsed);
         if (result.type === 'error') {
           onDone({ ok: false, message: result.text || '远端返回错误' });
           return;
@@ -470,7 +485,7 @@ class RemoteWorker implements BridgeWorker {
     onDone({ ok: true, text: aggregate || '(空回复)' });
   }
 
-  private extractStreamingPayload(payload: any): { type: 'delta' | 'done' | 'error' | 'ignore'; text: string } {
+  static extractStreamingPayload(payload: any): { type: 'delta' | 'done' | 'error' | 'ignore'; text: string } {
     if (!payload || typeof payload !== 'object') {
       return { type: 'ignore', text: '' };
     }
@@ -518,7 +533,7 @@ class RemoteWorker implements BridgeWorker {
     return { type: 'ignore', text: '' };
   }
 
-  private resolveInterruptUrl(rawUrl: string): string {
+  static resolveInterruptUrl(rawUrl: string): string {
     const trimmed = rawUrl.trim().replace(/\/$/, '');
     if (!trimmed) return '/interrupt';
     if (trimmed.endsWith('/interrupt')) return trimmed;
@@ -526,7 +541,7 @@ class RemoteWorker implements BridgeWorker {
     return `${trimmed}/interrupt`;
   }
 
-  private resolveInvokeUrl(rawUrl: string): string {
+  static resolveInvokeUrl(rawUrl: string): string {
     const trimmed = rawUrl.trim().replace(/\/$/, '');
     if (!trimmed) return '/invoke';
     if (trimmed.endsWith('/invoke')) return trimmed;
@@ -536,15 +551,35 @@ class RemoteWorker implements BridgeWorker {
 }
 
 class CodexWorker implements BridgeWorker {
+  private static timeoutForMethod(method: string): number {
+    switch (method) {
+      case 'initialize':
+        return 45_000;
+      case 'thread/start':
+      case 'thread/resume':
+        return 25_000;
+      case 'turn/start':
+        return 20_000;
+      case 'turn/interrupt':
+        return 5_000;
+      default:
+        return 20_000;
+    }
+  }
   private process: ChildProcessWithoutNullStreams | null = null;
   private outBuffer = '';
   private nextRequestId = 1;
-  private pending = new Map<string, (payload: any) => void>();
+  private pending = new Map<string, {
+    resolve: (value: any) => void;
+    reject: (error: Error) => void;
+    timeout: NodeJS.Timeout;
+  }>();
   private threadId: string | null = null;
   private activeTurnId: string | null = null;
   private configuredCwd: string | null = null;
   private configuredResumeId: string | null = null;
   private streamingText = '';
+  private stderrText = '';
   private activeTurn: PendingTurn | null = null;
 
   async send(
@@ -597,12 +632,7 @@ class CodexWorker implements BridgeWorker {
     this.configuredCwd = cwd;
     this.configuredResumeId = normalizedResume;
 
-    this.startProcess();
-
-    await this.sendRequest('initialize', {
-      clientInfo: { name: 'codex-bridge-vscode', version: '0.1.1' },
-      capabilities: { experimentalApi: true }
-    });
+    await this.startInitializedProcess();
 
     if (normalizedResume) {
       const result = await this.sendRequest('thread/resume', {
@@ -653,6 +683,7 @@ class CodexWorker implements BridgeWorker {
     const child = spawn(codexExec, ['app-server', '--listen', 'stdio://'], {
       stdio: 'pipe'
     });
+    this.stderrText = '';
 
     child.stdout.on('data', (chunk: Buffer) => {
       this.outBuffer += chunk.toString('utf8');
@@ -666,20 +697,43 @@ class CodexWorker implements BridgeWorker {
       }
     });
 
-    child.on('exit', () => {
-      this.cleanupProcess();
-      this.failTurn('Codex worker 已退出');
+    child.stderr.on('data', (chunk: Buffer) => {
+      this.stderrText += chunk.toString('utf8');
+    });
+
+    child.on('exit', (code, signal) => {
+      const exitMessage = this.buildExitMessage(code, signal);
+      this.cleanupProcess(exitMessage);
+      this.failTurn(exitMessage);
     });
 
     child.on('error', (err) => {
-      this.cleanupProcess();
+      this.cleanupProcess(err.message || 'Codex worker 启动失败');
       this.failTurn(err.message || 'Codex worker 启动失败');
     });
 
     this.process = child;
   }
 
-  private cleanupProcess(): void {
+  private async startInitializedProcess(): Promise<void> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      this.startProcess();
+      try {
+        await this.sendRequest('initialize', {
+          clientInfo: { name: 'agent-bridge-vscode', version: '0.1.1' },
+          capabilities: { experimentalApi: true }
+        });
+        return;
+      } catch (err) {
+        lastError = err;
+        this.cleanupProcess();
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error('initialize 失败');
+  }
+
+  private cleanupProcess(reason?: string): void {
     if (this.process) {
       this.process.stdout.removeAllListeners();
       this.process.removeAllListeners();
@@ -687,9 +741,16 @@ class CodexWorker implements BridgeWorker {
         this.process.kill();
       }
     }
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timeout);
+      if (reason) {
+        pending.reject(new Error(reason));
+      }
+    }
     this.process = null;
     this.pending.clear();
     this.outBuffer = '';
+    this.stderrText = '';
   }
 
   private sendRequest(method: string, params: any): Promise<any> {
@@ -701,17 +762,22 @@ class CodexWorker implements BridgeWorker {
     const payload = { jsonrpc: '2.0', id: Number(id), method, params };
 
     return new Promise((resolve, reject) => {
-      this.pending.set(id, (response) => {
-        if (response.error) {
-          reject(new Error(response.error.message || '未知错误'));
-          return;
-        }
-        resolve(response.result || {});
+      const timeoutMs = CodexWorker.timeoutForMethod(method);
+      const timeout = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`${method} 超时 (${timeoutMs}ms)`));
+      }, timeoutMs);
+
+      this.pending.set(id, {
+        resolve,
+        reject,
+        timeout
       });
 
       try {
         this.process?.stdin.write(JSON.stringify(payload) + '\n');
       } catch (err: any) {
+        clearTimeout(timeout);
         this.pending.delete(id);
         reject(new Error(err?.message || '发送请求失败'));
       }
@@ -728,9 +794,15 @@ class CodexWorker implements BridgeWorker {
 
     if (dict.id !== undefined) {
       const key = String(dict.id);
-      const cb = this.pending.get(key);
+      const pending = this.pending.get(key);
       this.pending.delete(key);
-      cb?.(dict);
+      if (!pending) return;
+      clearTimeout(pending.timeout);
+      if (dict.error) {
+        pending.reject(new Error(dict.error.message || '未知错误'));
+      } else {
+        pending.resolve(dict.result || {});
+      }
       return;
     }
 
@@ -822,11 +894,24 @@ class CodexWorker implements BridgeWorker {
     if (result?.threadId && typeof result.threadId === 'string') return result.threadId;
     return null;
   }
+
+  private buildExitMessage(code: number | null, signal: NodeJS.Signals | null): string {
+    const parts = ['Codex worker 已退出'];
+    if (typeof code === 'number') parts.push(`exit=${code}`);
+    if (signal) parts.push(`signal=${signal}`);
+    const stderr = this.stderrText.trim();
+    if (stderr) {
+      const compact = stderr.replace(/\s+/g, ' ').trim();
+      parts.push(compact.length > 220 ? `${compact.slice(0, 220)}...` : compact);
+    }
+    return parts.join(' | ');
+  }
 }
 
 class ClaudeWorker implements BridgeWorker {
   private process: ChildProcessWithoutNullStreams | null = null;
   private outBuffer = '';
+  private stderrText = '';
   private sessionId: string | null = null;
   private streamingText = '';
   private reasoningText = '';
@@ -862,14 +947,20 @@ class ClaudeWorker implements BridgeWorker {
     }
     args.push(message);
 
-    const child = spawn('claude', args, {
+    const child = spawn(resolveClaudeExecutable(), args, {
       cwd,
       stdio: 'pipe'
     });
     this.process = child;
+    this.stderrText = '';
+    child.stdin.end();
 
     child.stdout.on('data', (chunk: Buffer) => {
       this.outBuffer += chunk.toString('utf8');
+    });
+
+    child.stderr.on('data', (chunk: Buffer) => {
+      this.stderrText += chunk.toString('utf8');
     });
 
     child.on('error', (err) => {
@@ -880,6 +971,7 @@ class ClaudeWorker implements BridgeWorker {
     child.on('exit', (code, signal) => {
       const pending = this.activeTurn;
       const output = this.outBuffer.trim();
+      const stderr = this.stderrText.trim();
       this.cleanupProcess();
       if (!pending) return;
       if (signal) {
@@ -887,14 +979,14 @@ class ClaudeWorker implements BridgeWorker {
         return;
       }
       if (code !== 0) {
-        this.failTurn(`Claude worker 已退出 (exit=${code ?? 'unknown'})`);
+        this.failTurn(this.buildExitMessage(code, stderr));
         return;
       }
       if (!output) {
-        this.failTurn('Claude 未返回可解析结果');
+        this.failTurn(stderr ? `Claude 未返回可解析结果：${stderr}` : 'Claude 未返回可解析结果');
         return;
       }
-      this.handleJsonLine(output);
+      this.handleJsonOutput(output);
     });
   }
 
@@ -914,28 +1006,41 @@ class ClaudeWorker implements BridgeWorker {
     }
   }
 
-  private handleJsonLine(line: string): void {
-    let payload: any;
-    try {
-      payload = JSON.parse(line);
-    } catch {
-      return;
-    }
+  private handleJsonOutput(output: string): void {
+    const lines = output
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
 
-    if (typeof payload.session_id === 'string' && payload.session_id) {
-      this.sessionId = payload.session_id;
-    }
-
-    if (!this.activeTurn) return;
-
-    if (payload.type === 'result') {
-      if (payload.subtype === 'success' && !payload.is_error) {
-        const text = (typeof payload.result === 'string' && payload.result.trim()) || '(空回复)';
-        this.activeTurn.onDelta(text);
-        this.completeTurn(text);
-      } else {
-        this.failTurn(payload.result || 'Claude 执行失败');
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      let payload: any;
+      try {
+        payload = JSON.parse(lines[index]);
+      } catch {
+        continue;
       }
+
+      if (typeof payload.session_id === 'string' && payload.session_id) {
+        this.sessionId = payload.session_id;
+      }
+
+      if (!this.activeTurn) return;
+
+      if (payload.type === 'result') {
+        if (payload.subtype === 'success' && !payload.is_error) {
+          const text = (typeof payload.result === 'string' && payload.result.trim()) || '(空回复)';
+          this.activeTurn.onDelta(text);
+          this.completeTurn(text);
+        } else {
+          this.failTurn(payload.result || 'Claude 执行失败');
+        }
+        return;
+      }
+    }
+
+    if (this.activeTurn) {
+      const stderr = this.stderrText.trim();
+      this.failTurn(stderr ? `Claude 返回内容不可解析：${stderr}` : 'Claude 返回内容不可解析');
     }
   }
 
@@ -960,10 +1065,20 @@ class ClaudeWorker implements BridgeWorker {
   private cleanupProcess(): void {
     if (this.process) {
       this.process.stdout.removeAllListeners();
+      this.process.stderr.removeAllListeners();
       this.process.removeAllListeners();
     }
     this.process = null;
     this.outBuffer = '';
+    this.stderrText = '';
+  }
+
+  private buildExitMessage(code: number | null, stderr: string): string {
+    const compact = stderr.replace(/\s+/g, ' ').trim();
+    if (compact) {
+      return `Claude worker 已退出 (exit=${code ?? 'unknown'})：${compact}`;
+    }
+    return `Claude worker 已退出 (exit=${code ?? 'unknown'})`;
   }
 }
 
@@ -977,18 +1092,24 @@ class BridgeController {
   private panel: vscode.WebviewPanel | null = null;
   private webview: vscode.Webview | null = null;
   private reasoningMap = new Map<string, string>();
+  private claudeProjectPathCache = new Map<string, Promise<string>>();
+  private cliHealthCache = new Map<LocalCliTool, { ok: boolean; message: string }>();
+  private remoteCallbackBaseUrl = '';
+  private lastRemoteInterruptPeer: { directInterruptUrl?: string; hubNodeId?: string } | null = null;
   private interruptedBySide: Record<Side, boolean> = { A: false, B: false };
   private remoteHeartbeatTimer: NodeJS.Timeout | null = null;
   private remotePeerRefreshTimer: NodeJS.Timeout | null = null;
   private readonly localRemoteNodeId = randomUUID();
   private remoteServer = new RemoteInvokeServer(
-    async ({ text, onDelta, onDone, targetTool, targetProjectPath, targetSessionId }) =>
+    async ({ text, onDelta, onDone, targetTool, targetProjectPath, targetSessionId, sourceInterruptUrl, sourceNodeId }) =>
       this.handleRemoteInvoke(text, onDelta, onDone, {
         tool: targetTool,
         projectPath: targetProjectPath,
-        sessionId: targetSessionId
+        sessionId: targetSessionId,
+        sourceInterruptUrl,
+        sourceNodeId
       }),
-    async () => this.handleRemoteInterrupt()
+    async () => this.handleIncomingRemoteInterrupt()
   );
 
   private state: BridgeState = {
@@ -1017,14 +1138,19 @@ class BridgeController {
     remotePeerId: '',
     remoteDeviceName: os.hostname(),
     remotePeerOptions: [],
+    remotePeerLinked: false,
     remoteConnectionSnippet: '',
     remoteConnectivity: 'idle',
-    remoteTokenHint: '直连时，客户端与主机填同一个 Token；Hub 模式下，客户端、主机、Hub 都必须使用同一个 Token。',
+    remoteTokenHint: '这里是当前连接的访问 Key，不是 Hub 全局口令。直连时双方保持一致；Hub 模式下它会随分享配置一起传递，用于访问目标节点。',
     remoteTargetTool: 'codex',
     remoteTargetProjectPath: '',
     remoteTargetSessionId: '',
     remoteTargetLabel: '',
-    remoteAutoRelayEnabled: false
+    remoteAutoRelayEnabled: false,
+    availableHostTools: [],
+    remoteHostTool: 'codex',
+    remoteHostProjectPath: '',
+    remoteHostSessionId: ''
   };
 
   attachPanel(panel: vscode.WebviewPanel, projectAPath: string): void {
@@ -1075,13 +1201,53 @@ class BridgeController {
         {
           const prevToolA = this.state.toolA;
           const prevToolB = this.state.toolB;
+          const prevProjectAPath = this.state.projectAPath;
+          const prevProjectBPath = this.state.projectBPath;
+          const prevRemoteExportSide = this.state.remoteExportSide;
+          const prevRemoteHostTool = this.state.remoteHostTool;
+          const prevRemoteHostProjectPath = this.state.remoteHostProjectPath;
+          const prevRemoteTargetTool = this.state.remoteTargetTool;
+          const prevRemoteTargetProjectPath = this.state.remoteTargetProjectPath;
+          const nextProjectAPath = String(message.projectAPath || this.state.projectAPath || '');
+          const nextProjectBPath = String(message.projectBPath || '');
+          const nextRemoteExportSide = this.normalizeSide(message.remoteExportSide);
+          const nextRemoteHostProjectPath = String(message.remoteHostProjectPath || '');
+          const nextRemoteTargetProjectPath = String(message.remoteTargetProjectPath || '');
+          const prevMirroredHostTool = this.localToolForSide(prevRemoteExportSide);
           this.state.toolA = this.normalizeCliTool(message.toolA);
           this.state.toolB = this.normalizeCliTool(message.toolB);
-          this.state.sessionA = prevToolA !== this.state.toolA ? '' : String(message.sessionA || '');
-          this.state.sessionB = prevToolB !== this.state.toolB ? '' : String(message.sessionB || '');
+          this.state.projectAPath = nextProjectAPath;
+          this.state.projectBPath = nextProjectBPath;
+          this.state.remoteExportSide = nextRemoteExportSide;
+          this.state.sessionA =
+            prevToolA !== this.state.toolA || prevProjectAPath !== nextProjectAPath
+              ? ''
+              : String(message.sessionA || '');
+          this.state.sessionB =
+            prevToolB !== this.state.toolB || prevProjectBPath !== nextProjectBPath
+              ? ''
+              : String(message.sessionB || '');
+          const requestedRemoteHostTool = this.normalizeHostTool(message.remoteHostTool);
+          const nextMirroredHostTool = this.localToolForSide(nextRemoteExportSide);
+          const shouldFollowExportTool =
+            !!prevMirroredHostTool &&
+            prevRemoteHostTool === prevMirroredHostTool &&
+            !!nextMirroredHostTool;
+          this.state.remoteHostTool = shouldFollowExportTool
+            ? this.normalizeHostTool(nextMirroredHostTool)
+            : requestedRemoteHostTool;
+          this.state.remoteHostProjectPath = nextRemoteHostProjectPath;
+          this.state.remoteHostSessionId =
+            prevRemoteHostTool !== this.state.remoteHostTool || prevRemoteHostProjectPath !== nextRemoteHostProjectPath
+              ? ''
+              : String(message.remoteHostSessionId || '');
+          this.state.remoteTargetTool = this.normalizeLocalCliTool(message.remoteTargetTool);
+          this.state.remoteTargetProjectPath = nextRemoteTargetProjectPath;
+          this.state.remoteTargetSessionId =
+            prevRemoteTargetTool !== this.state.remoteTargetTool || prevRemoteTargetProjectPath !== nextRemoteTargetProjectPath
+              ? ''
+              : String(message.remoteTargetSessionId || '');
         }
-        this.state.projectAPath = String(message.projectAPath || this.state.projectAPath || '');
-        this.state.projectBPath = String(message.projectBPath || '');
         this.state.autoRelayEnabled = !!message.autoRelayEnabled;
         this.state.stopOnStageDone = !!message.stopOnStageDone;
         this.state.chatControlExpanded = !!message.chatControlExpanded;
@@ -1090,13 +1256,9 @@ class BridgeController {
         this.state.remoteUrl = String(message.remoteUrl || '');
         this.state.remoteToken = this.normalizeRemoteToken(message.remoteToken);
         this.state.remoteListenPort = this.normalizePort(message.remoteListenPort);
-        this.state.remoteExportSide = this.normalizeSide(message.remoteExportSide);
         this.state.remoteHubUrl = String(message.remoteHubUrl || '');
         this.state.remotePeerId = String(message.remotePeerId || '');
         this.state.remoteDeviceName = String(message.remoteDeviceName || this.state.remoteDeviceName || os.hostname());
-        this.state.remoteTargetTool = message.remoteTargetTool === 'claude' ? 'claude' : 'codex';
-        this.state.remoteTargetProjectPath = String(message.remoteTargetProjectPath || '');
-        this.state.remoteTargetSessionId = String(message.remoteTargetSessionId || '');
         this.state.remoteAutoRelayEnabled = !!message.remoteAutoRelayEnabled;
         this.refreshRemoteBridge()
           .then(() => this.sync())
@@ -1104,9 +1266,18 @@ class BridgeController {
         break;
       case 'refreshOptions':
         this.loadCliOptions()
-          .then(() => this.sync())
+          .then(() => this.refreshRemoteBridge())
+          .then(() => {
+            this.sync();
+            this.webview?.postMessage({ type: 'refreshOptionsResult', ok: true });
+          })
           .catch((err: any) => {
             this.appendSystem(`刷新下拉数据失败：${err?.message || '未知错误'}`);
+            this.webview?.postMessage({
+              type: 'refreshOptionsResult',
+              ok: false,
+              message: err?.message || '未知错误'
+            });
           });
         break;
       case 'send':
@@ -1119,9 +1290,11 @@ class BridgeController {
         break;
       case 'sendRemote':
         {
-          const rawTarget = String(message.target || 'A');
-          const target: 'A' | 'B' | 'BOTH' =
-            rawTarget === 'B' || rawTarget === 'BOTH' ? rawTarget : 'A';
+          const rawTarget = String(message.target || 'REMOTE');
+          const target =
+            rawTarget === 'LOCAL' || rawTarget === 'REMOTE' || rawTarget === 'A' || rawTarget === 'B' || rawTarget === 'BOTH'
+              ? rawTarget
+              : 'REMOTE';
           this.handleRemoteSend(target, String(message.text || ''));
         }
         break;
@@ -1160,10 +1333,29 @@ class BridgeController {
         }
         break;
       case 'applyRemoteConfigSnippet':
-        this.applyRemoteConfigSnippetInternal(String(message.text || ''));
-        this.refreshRemoteBridge()
-          .then(() => this.sync())
-          .catch(() => this.sync());
+        {
+          const source = message.source === 'auto' ? 'auto' : 'manual';
+          const result = this.applyRemoteConfigSnippetInternal(String(message.text || ''));
+          this.refreshRemoteBridge()
+            .then(() => {
+              this.sync();
+              this.webview?.postMessage({
+                type: 'applyRemoteConfigResult',
+                ok: result.ok,
+                message: result.message,
+                source
+              });
+            })
+            .catch((err: any) => {
+              this.sync();
+              this.webview?.postMessage({
+                type: 'applyRemoteConfigResult',
+                ok: false,
+                message: err?.message || result.message || '应用配置失败',
+                source
+              });
+            });
+        }
         break;
       default:
         break;
@@ -1182,12 +1374,37 @@ class BridgeController {
     }
   }
 
-  private handleRemoteSend(target: 'A' | 'B' | 'BOTH', text: string): void {
+  private handleRemoteSend(target: string, text: string): void {
     const trimmed = text.trim();
     if (!trimmed) return;
-    const sides = this.remoteConversationSendSides();
-    const effectiveSides = target === 'BOTH' ? sides : sides.filter((side) => side === target);
-    for (const side of effectiveSides) {
+
+    if (target === 'LOCAL' || target === 'BOTH') {
+      for (const side of this.remoteConversationLocalSendSides()) {
+        this.sendTo(side, trimmed, false, {
+          channel: 'remote',
+          userPeer: 'local',
+          assistantPeer: 'local'
+        });
+      }
+    }
+
+    if (target === 'REMOTE' || target === 'BOTH') {
+      if (this.state.remoteMode === 'host') {
+        this.sendToConnectedRemotePeer(trimmed);
+      } else {
+        for (const side of this.remoteConversationRemoteSendSides()) {
+          this.sendTo(side, trimmed, false, {
+            channel: 'remote',
+            userPeer: 'local',
+            assistantPeer: 'remote'
+          });
+        }
+      }
+      return;
+    }
+
+    if (target === 'A' || target === 'B') {
+      const side = target;
       const tool = this.selectedTool(side);
       this.sendTo(side, trimmed, false, {
         channel: 'remote',
@@ -1207,20 +1424,32 @@ class BridgeController {
     return sides;
   }
 
-  private remoteConversationSendSides(): Side[] {
+  private remoteConversationLocalSendSides(): Side[] {
     if (this.state.remoteMode === 'host') {
       return [this.state.remoteExportSide];
     }
-
     const remoteSides = this.remoteConversationSides();
     if (remoteSides.length === 1) {
       const remoteSide = remoteSides[0];
       const localSide: Side = remoteSide === 'A' ? 'B' : 'A';
       if (this.selectedTool(localSide) !== 'remote') {
-        return [localSide, remoteSide];
+        return [localSide];
       }
     }
-    return remoteSides;
+    return [];
+  }
+
+  private remoteConversationRemoteSendSides(): Side[] {
+    if (this.state.remoteMode === 'host') {
+      return this.canSendToConnectedRemotePeer() ? [this.state.remoteExportSide] : [];
+    }
+    return this.remoteConversationSides();
+  }
+
+  private remoteConversationSendSides(): Side[] {
+    const localSides = this.remoteConversationLocalSendSides();
+    const remoteSides = this.remoteConversationRemoteSendSides();
+    return [...new Set([...localSides, ...remoteSides])];
   }
 
   private nextRemoteRelayTarget(fromSide: Side): { side: Side; userPeer: ChatPeer; assistantPeer: ChatPeer } | null {
@@ -1239,6 +1468,13 @@ class BridgeController {
       return { side: remoteSide, userPeer: 'local', assistantPeer: 'remote' };
     }
     return null;
+  }
+
+  private canSendToConnectedRemotePeer(): boolean {
+    return !!(
+      this.lastRemoteInterruptPeer &&
+      (this.lastRemoteInterruptPeer.hubNodeId || this.lastRemoteInterruptPeer.directInterruptUrl)
+    );
   }
 
   private sendTo(side: Side, message: string, initiatedByRelay: boolean, context?: SendContext): void {
@@ -1260,6 +1496,12 @@ class BridgeController {
       return;
     }
 
+    const cliFailure = this.localCliFailureMessage(tool);
+    if (cliFailure) {
+      this.appendSystem(`${side} 发送失败：${cliFailure}`, side, channel);
+      return;
+    }
+
     if (side === 'A' ? this.state.isSendingA : this.state.isSendingB) {
       this.appendSystem(`${side} 忙碌中，稍后再试`, side, channel);
       return;
@@ -1267,9 +1509,7 @@ class BridgeController {
 
     if (!initiatedByRelay) {
       this.appendChat({ id: randomUUID(), time: Date.now(), side, role: 'user', text: message, channel, peer: userPeer });
-    } else if (channel === 'remote') {
-      this.appendChat({ id: randomUUID(), time: Date.now(), side, role: 'user', text: message, channel, peer: userPeer });
-    } else {
+    } else if (channel !== 'remote') {
       this.appendSystem(`自动转发到 ${side}`, side, channel);
     }
 
@@ -1286,76 +1526,191 @@ class BridgeController {
     });
 
     const outboundMessage = this.composeOutboundMessage(message);
-    worker.send(
-      outboundMessage,
-      projectPath,
-      sessionId || undefined,
-      (delta) => {
-        this.appendAssistantDelta(assistantId, delta);
-      },
-      (turnId, summaryIndex, delta) => {
-        this.bindTurnId(assistantId, turnId);
-        const key = `${side}|${turnId}|${summaryIndex}`;
-        this.reasoningMap.set(key, (this.reasoningMap.get(key) || '') + delta);
-        this.sync();
-      },
-      (result) => {
-        this.setSending(side, false);
-        const interrupted = this.interruptedBySide[side];
-        if (interrupted) {
-          this.interruptedBySide[side] = false;
-        }
-        if (!result.ok) {
-          this.appendSystem(`${side} 执行失败：${result.message}`, side, channel);
-          return;
-        }
+    const runAttempt = (resumeId: string | undefined, allowRetryWithoutSession: boolean): void => {
+      worker.send(
+        outboundMessage,
+        projectPath,
+        resumeId,
+        (delta) => {
+          this.appendAssistantDelta(assistantId, delta);
+        },
+        (turnId, summaryIndex, delta) => {
+          this.bindTurnId(assistantId, turnId);
+          const key = `${side}|${turnId}|${summaryIndex}`;
+          this.reasoningMap.set(key, (this.reasoningMap.get(key) || '') + delta);
+          this.sync();
+        },
+        (result) => {
+          if (!result.ok && allowRetryWithoutSession && this.shouldRetryWithoutSession(tool, resumeId, result.message)) {
+            this.clearSelectedSession(side);
+            this.appendSystem(`${side} 最近会话恢复失败，已自动切换为新会话重试`, side, channel);
+            runAttempt(undefined, false);
+            return;
+          }
 
-        this.upsertAssistant(assistantId, result.text, side);
-        if (interrupted) {
-          this.appendSystem(`${side} 已打断`, side, channel);
-          return;
-        }
+          this.setSending(side, false);
+          const interrupted = this.interruptedBySide[side];
+          if (interrupted) {
+            this.interruptedBySide[side] = false;
+          }
+          if (!result.ok) {
+            this.appendSystem(`${side} 执行失败：${result.message}`, side, channel);
+            return;
+          }
 
-        if (channel === 'remote') {
-          if (this.state.remoteAutoRelayEnabled && this.state.stopOnStageDone && this.isStageDone(result.text)) {
-            this.state.remoteAutoRelayEnabled = false;
-            this.appendSystem('检测到阶段完成，已停止跨设备自动接力', undefined, 'remote');
+          this.upsertAssistant(assistantId, result.text, side);
+          if (interrupted) {
+            this.appendSystem(`${side} 已打断`, side, channel);
+            return;
+          }
+
+          if (channel === 'remote') {
+            if (this.state.remoteAutoRelayEnabled && this.state.stopOnStageDone && this.isStageDone(result.text)) {
+              this.state.remoteAutoRelayEnabled = false;
+              this.appendSystem('检测到阶段完成，已停止跨设备自动接力', undefined, 'remote');
+              this.sync();
+              return;
+            }
+
+            if (this.state.remoteAutoRelayEnabled) {
+              const relay = this.nextRemoteRelayTarget(side);
+              const payload = this.sanitizedRelayPayload(result.text);
+              if (relay && payload.trim()) {
+                this.sendTo(relay.side, payload, true, {
+                  channel: 'remote',
+                  userPeer: relay.userPeer,
+                  assistantPeer: relay.assistantPeer
+                });
+              }
+            }
+            return;
+          }
+
+          if (this.state.autoRelayEnabled && this.state.stopOnStageDone && this.isStageDone(result.text)) {
+            this.state.autoRelayEnabled = false;
+            this.appendSystem('检测到阶段完成，已停止自动互发');
             this.sync();
             return;
           }
 
-          if (this.state.remoteAutoRelayEnabled) {
-            const relay = this.nextRemoteRelayTarget(side);
+          if (this.state.autoRelayEnabled) {
             const payload = this.sanitizedRelayPayload(result.text);
-            if (relay && payload.trim()) {
-              this.sendTo(relay.side, payload, true, {
-                channel: 'remote',
-                userPeer: relay.userPeer,
-                assistantPeer: relay.assistantPeer
-              });
+            if (payload.trim()) {
+              this.sendTo(side === 'A' ? 'B' : 'A', payload, true);
             }
           }
-          return;
         }
+      );
+    };
 
-        if (this.state.autoRelayEnabled && this.state.stopOnStageDone && this.isStageDone(result.text)) {
-          this.state.autoRelayEnabled = false;
-          this.appendSystem('检测到阶段完成，已停止自动互发');
-          this.sync();
-          return;
-        }
-
-        if (this.state.autoRelayEnabled) {
-          const payload = this.sanitizedRelayPayload(result.text);
-          if (payload.trim()) {
-            this.sendTo(side === 'A' ? 'B' : 'A', payload, true);
-          }
-        }
-      }
-    );
+    runAttempt(sessionId || undefined, !!sessionId && tool !== 'remote');
   }
 
-  private handleRemoteUiInterrupt(): void {
+  private sendToConnectedRemotePeer(message: string): void {
+    const peer = this.lastRemoteInterruptPeer;
+    if (!peer) {
+      this.appendSystem('当前还没有已连接的远端 AI，可先让对端发来一条消息建立会话', undefined, 'remote');
+      return;
+    }
+
+    const side = this.state.remoteExportSide;
+    const busy = side === 'A' ? this.state.isSendingA : this.state.isSendingB;
+    if (busy) {
+      this.appendSystem(`${side} 忙碌中，稍后再试`, side, 'remote');
+      return;
+    }
+
+    const token = this.state.remoteToken.trim();
+    if (!token) {
+      this.appendSystem('远端发送失败：访问 Key 为空', side, 'remote');
+      return;
+    }
+
+    const hubUrl = this.state.remoteHubUrl.trim();
+    const callbackUrl = this.remoteCallbackBaseUrl
+      ? `${this.remoteCallbackBaseUrl.replace(/\/$/, '')}/interrupt`
+      : undefined;
+
+    let requestUrl = '';
+    let requestHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+    let requestBody = '';
+
+    if (peer.hubNodeId && hubUrl) {
+      requestUrl = `${hubUrl.replace(/\/$/, '')}/relay/invoke`;
+      requestBody = JSON.stringify({
+        token,
+        targetNodeId: peer.hubNodeId,
+        text: message,
+        stream: true,
+        sourceNodeId: this.localRemoteNodeId
+      });
+    } else if (peer.directInterruptUrl) {
+      requestUrl = RemoteWorker.resolveInvokeUrl(peer.directInterruptUrl);
+      requestBody = JSON.stringify({
+        token,
+        text: message,
+        stream: true,
+        sourceInterruptUrl: callbackUrl
+      });
+    } else {
+      this.appendSystem('当前还没有可用的远端回传地址', side, 'remote');
+      return;
+    }
+
+    this.appendChat({
+      id: randomUUID(),
+      time: Date.now(),
+      side,
+      role: 'user',
+      text: message,
+      channel: 'remote',
+      peer: 'local'
+    });
+    this.setSending(side, true);
+    const assistantId = randomUUID();
+    this.appendChat({
+      id: assistantId,
+      time: Date.now(),
+      side,
+      role: 'assistant',
+      text: '',
+      channel: 'remote',
+      peer: 'remote'
+    });
+
+    fetch(requestUrl, {
+      method: 'POST',
+      headers: requestHeaders,
+      body: requestBody
+    })
+      .then(async (response) => {
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(text || `远端调用失败 (${response.status})`);
+        }
+        await RemoteWorker.consumeStreamingResponse(
+          response,
+          (delta) => {
+            this.appendAssistantDelta(assistantId, delta);
+          },
+          (result) => {
+            this.setSending(side, false);
+            if (!result.ok) {
+              this.appendSystem(`远端发送失败：${result.message}`, side, 'remote');
+              return;
+            }
+            this.upsertAssistant(assistantId, result.text, side);
+          }
+        );
+      })
+      .catch((err: any) => {
+        this.setSending(side, false);
+        this.appendSystem(`远端发送失败：${err?.message || '未知错误'}`, side, 'remote');
+      });
+  }
+
+  private async handleRemoteUiInterrupt(): Promise<void> {
+    const peerInterrupted = await this.propagateRemoteInterrupt();
     const sides = this.remoteConversationSendSides();
     let interruptedCount = 0;
 
@@ -1370,14 +1725,107 @@ class BridgeController {
       interruptedCount += 1;
     }
 
-    const hadRelay = this.state.remoteAutoRelayEnabled;
+    const hadRelay = this.state.remoteAutoRelayEnabled || this.state.autoRelayEnabled;
     this.state.remoteAutoRelayEnabled = false;
-    if (interruptedCount > 0 || hadRelay) {
+    this.state.autoRelayEnabled = false;
+    if (interruptedCount > 0 || hadRelay || peerInterrupted) {
       this.appendSystem('已停止跨设备对话流，并关闭自动接力', undefined, 'remote');
       this.sync();
       return;
     }
     this.appendSystem('当前没有进行中的跨设备会话', undefined, 'remote');
+  }
+
+  private async handleIncomingRemoteInterrupt(): Promise<void> {
+    if (this.state.remoteMode === 'host') {
+      await this.handleRemoteInterrupt();
+      return;
+    }
+
+    const sides = this.remoteConversationSendSides();
+    let interruptedCount = 0;
+    for (const side of sides) {
+      const busy = side === 'A' ? this.state.isSendingA : this.state.isSendingB;
+      if (!busy) continue;
+      this.interruptedBySide[side] = true;
+      for (const tool of ['codex', 'claude', 'remote'] as const) {
+        this.workers[side][tool].interrupt();
+      }
+      this.setSending(side, false);
+      interruptedCount += 1;
+    }
+    const hadRelay = this.state.remoteAutoRelayEnabled || this.state.autoRelayEnabled;
+    this.state.remoteAutoRelayEnabled = false;
+    this.state.autoRelayEnabled = false;
+    if (interruptedCount > 0 || hadRelay) {
+      this.appendSystem('远端已请求停止，当前跨设备对话已打断', undefined, 'remote');
+      this.sync();
+    }
+  }
+
+  private async propagateRemoteInterrupt(): Promise<boolean> {
+    const token = this.state.remoteToken.trim();
+    if (!token) return false;
+
+    if (this.state.remoteMode === 'client') {
+      const hubUrl = this.state.remoteHubUrl.trim();
+      const peerId = this.state.remotePeerId.trim();
+      const directUrl = this.state.remoteUrl.trim();
+      if (!hubUrl && !directUrl) return false;
+      try {
+        if (hubUrl && peerId) {
+          const response = await fetch(`${hubUrl.replace(/\/$/, '')}/relay/interrupt`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token, targetNodeId: peerId })
+          });
+          return response.ok;
+        }
+        if (directUrl) {
+          const response = await fetch(this.resolveDirectInterruptUrl(directUrl), {
+            method: 'POST',
+            headers: { 'x-bridge-token': token }
+          });
+          return response.ok;
+        }
+      } catch {
+        return false;
+      }
+      return false;
+    }
+
+    if (this.state.remoteMode !== 'host' || !this.lastRemoteInterruptPeer) return false;
+    try {
+      if (this.lastRemoteInterruptPeer.hubNodeId && this.state.remoteHubUrl.trim()) {
+        const response = await fetch(`${this.state.remoteHubUrl.trim().replace(/\/$/, '')}/relay/interrupt`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            token,
+            targetNodeId: this.lastRemoteInterruptPeer.hubNodeId
+          })
+        });
+        return response.ok;
+      }
+      if (this.lastRemoteInterruptPeer.directInterruptUrl) {
+        const response = await fetch(this.lastRemoteInterruptPeer.directInterruptUrl, {
+          method: 'POST',
+          headers: { 'x-bridge-token': token }
+        });
+        return response.ok;
+      }
+    } catch {
+      return false;
+    }
+    return false;
+  }
+
+  private resolveDirectInterruptUrl(rawUrl: string): string {
+    const trimmed = rawUrl.trim().replace(/\/$/, '');
+    if (!trimmed) return '/interrupt';
+    if (trimmed.endsWith('/interrupt')) return trimmed;
+    if (trimmed.endsWith('/invoke')) return trimmed.slice(0, -'/invoke'.length) + '/interrupt';
+    return `${trimmed}/interrupt`;
   }
 
   private handleInterrupt(rawTarget: string): void {
@@ -1401,8 +1849,14 @@ class BridgeController {
       this.state.autoRelayEnabled = false;
       this.appendSystem(`已打断 ${target === 'BOTH' ? 'A/B' : target}，并停止自动互发`);
       this.sync();
+      if (target === 'BOTH' && this.remoteConversationSides().length > 0) {
+        void this.handleRemoteUiInterrupt();
+      }
     } else {
       this.appendSystem('当前无进行中的任务可打断');
+      if (target === 'BOTH' && this.remoteConversationSides().length > 0) {
+        void this.handleRemoteUiInterrupt();
+      }
     }
   }
 
@@ -1415,6 +1869,81 @@ class BridgeController {
 
   private selectedTool(side: Side): CliTool {
     return side === 'A' ? this.state.toolA : this.state.toolB;
+  }
+
+  private availableHostTools(): LocalCliTool[] {
+    return this.state.availableHostTools;
+  }
+
+  private localToolForSide(side: Side): LocalCliTool | null {
+    const tool = this.selectedTool(side);
+    return tool === 'remote' ? null : tool;
+  }
+
+  private selectedRemoteHostTool(): LocalCliTool {
+    return this.localToolForSide(this.state.remoteExportSide) || this.normalizeHostTool(this.state.remoteHostTool);
+  }
+
+  private selectedRemoteHostProjectPath(): string {
+    const side = this.state.remoteExportSide;
+    const mirroredProjectPath = side === 'A' ? this.state.projectAPath.trim() : this.state.projectBPath.trim();
+    if (mirroredProjectPath) return mirroredProjectPath;
+    return this.state.remoteHostProjectPath.trim();
+  }
+
+  private selectedRemoteHostSessionId(projectPath = this.selectedRemoteHostProjectPath()): string {
+    const side = this.state.remoteExportSide;
+    const mirroredTool = this.localToolForSide(side);
+    if (mirroredTool) {
+      const mirroredSideSession = side === 'A' ? this.state.sessionA : this.state.sessionB;
+      return this.normalizedResumeId(mirroredTool, mirroredSideSession, projectPath);
+    }
+    const explicitSessionId = this.normalizedResumeId(
+      this.selectedRemoteHostTool(),
+      this.state.remoteHostSessionId,
+      projectPath
+    );
+    if (explicitSessionId) return explicitSessionId;
+
+    const mirroredSideSession = side === 'A' ? this.state.sessionA : this.state.sessionB;
+    return this.normalizedResumeId(this.selectedRemoteHostTool(), mirroredSideSession, projectPath);
+  }
+
+  private defaultInboundRemoteSide(): Side {
+    if (this.state.remoteMode === 'client') {
+      const remoteSides = this.remoteConversationSides();
+      if (remoteSides.length === 1) {
+        const remoteSide = remoteSides[0];
+        const localSide: Side = remoteSide === 'A' ? 'B' : 'A';
+        if (this.selectedTool(localSide) !== 'remote') {
+          return localSide;
+        }
+      }
+    }
+    return this.state.remoteExportSide;
+  }
+
+  private selectedInboundRemoteTool(side = this.defaultInboundRemoteSide()): LocalCliTool {
+    const sideTool = this.selectedTool(side);
+    return sideTool === 'remote' ? this.selectedRemoteHostTool() : sideTool;
+  }
+
+  private selectedInboundRemoteProjectPath(side = this.defaultInboundRemoteSide()): string {
+    const sideProjectPath = side === 'A' ? this.state.projectAPath.trim() : this.state.projectBPath.trim();
+    return sideProjectPath || this.selectedRemoteHostProjectPath();
+  }
+
+  private selectedInboundRemoteSessionId(
+    side = this.defaultInboundRemoteSide(),
+    tool = this.selectedInboundRemoteTool(side),
+    projectPath = this.selectedInboundRemoteProjectPath(side)
+  ): string {
+    const sideTool = this.selectedTool(side);
+    const sideSession = side === 'A' ? this.state.sessionA : this.state.sessionB;
+    if (sideTool !== 'remote' && sideTool === tool) {
+      return this.normalizedResumeId(tool, sideSession, projectPath);
+    }
+    return this.selectedRemoteHostSessionId(projectPath);
   }
 
   private pickRemoteImportSide(): Side {
@@ -1443,6 +1972,16 @@ class BridgeController {
     return 'codex';
   }
 
+  private normalizeLocalCliTool(value: unknown): LocalCliTool {
+    return value === 'claude' ? 'claude' : 'codex';
+  }
+
+  private normalizeHostTool(value: unknown): LocalCliTool {
+    const normalized = this.normalizeLocalCliTool(value);
+    if (this.state.availableHostTools.includes(normalized)) return normalized;
+    return this.state.availableHostTools[0] || normalized;
+  }
+
   private normalizeRemoteMode(value: unknown): RemoteMode {
     return value === 'host' || value === 'client' ? value : 'off';
   }
@@ -1463,15 +2002,43 @@ class BridgeController {
     return token;
   }
 
+  private clearSelectedSession(side: Side): void {
+    if (side === 'A') this.state.sessionA = '';
+    if (side === 'B') this.state.sessionB = '';
+    this.sync();
+  }
+
+  private shouldRetryWithoutSession(tool: CliTool, resumeId: string | undefined, message: string): boolean {
+    if (!resumeId || tool === 'remote') return false;
+    const lowered = String(message || '').toLowerCase();
+    if (!lowered) return false;
+
+    const retryHints = [
+      'thread/resume',
+      'resume',
+      'session',
+      'conversation',
+      'invalid thread',
+      'not found',
+      '超时',
+      'timeout',
+      '会话'
+    ];
+
+    return retryHints.some((hint) => lowered.includes(hint));
+  }
+
   private remoteConfig(): {
     mode: RemoteMode;
     url: string;
     token: string;
     hubUrl: string;
     peerId: string;
-    targetTool: CliTool;
+    targetTool: LocalCliTool;
     targetProjectPath: string;
     targetSessionId: string;
+    sourceInterruptUrl?: string;
+    sourceNodeId?: string;
   } {
     return {
       mode: this.state.remoteMode,
@@ -1481,36 +2048,36 @@ class BridgeController {
       peerId: this.state.remotePeerId,
       targetTool: this.state.remoteTargetTool,
       targetProjectPath: this.state.remoteTargetProjectPath,
-      targetSessionId: this.state.remoteTargetSessionId
+      targetSessionId: this.state.remoteTargetSessionId,
+      sourceInterruptUrl: this.state.remoteMode === 'client' && this.remoteCallbackBaseUrl
+        ? `${this.remoteCallbackBaseUrl.replace(/\/$/, '')}/interrupt`
+        : undefined,
+      sourceNodeId: this.state.remoteMode === 'client' && this.state.remoteHubUrl.trim()
+        ? this.localRemoteNodeId
+        : undefined
     };
   }
 
   private async refreshRemoteBridge(): Promise<void> {
     const hubUrl = this.state.remoteHubUrl.trim();
     const tokenState = this.describeRemoteToken();
-    this.state.remoteTokenHint = '直连时，客户端与主机填同一个 Token；Hub 模式下，客户端、主机、Hub 都必须使用同一个 Token。';
+    this.state.remoteTokenHint = '这里是当前连接的访问 Key，不是 Hub 全局口令。直连时双方保持一致；Hub 模式下它会随分享配置一起传递，用于访问目标节点。';
     if (this.state.remoteMode !== 'client') {
       this.state.remoteAutoRelayEnabled = false;
     }
     if (this.state.remoteMode !== 'host') {
+      this.state.remotePeerLinked = false;
+    }
+    if (this.state.remoteMode === 'off') {
+      this.remoteCallbackBaseUrl = '';
+      this.lastRemoteInterruptPeer = null;
       await this.unregisterFromHub().catch(() => undefined);
       await this.remoteServer.stop().catch(() => undefined);
       this.stopRemoteHeartbeat();
-      if (this.state.remoteMode === 'client') {
-        if (hubUrl) {
-          await this.refreshHubPeers();
-          const selected = this.state.remotePeerOptions.find((item) => item.id === this.state.remotePeerId);
-          this.state.remoteStatus = `客户端模式 -> Hub ${hubUrl} / ${selected?.label || this.state.remotePeerId || '未选择节点'} / 节点数 ${this.state.remotePeerOptions.length} / ${tokenState}`;
-        } else {
-          this.state.remotePeerOptions = [];
-          this.state.remoteStatus = `客户端模式 -> ${this.state.remoteUrl || '未配置 URL'} / ${tokenState}`;
-        }
-        await this.checkRemoteConnectivity();
-      } else {
-        this.state.remotePeerOptions = [];
-        this.state.remoteStatus = '未启用';
-        this.state.remoteConnectivity = 'idle';
-      }
+      this.state.remotePeerOptions = [];
+      this.state.remotePeerLinked = false;
+      this.state.remoteStatus = '未启用';
+      this.state.remoteConnectivity = 'idle';
       this.state.remoteConnectionSnippet = this.buildRemoteConnectionSnippet();
       return;
     }
@@ -1518,20 +2085,49 @@ class BridgeController {
     try {
       const port = await this.remoteServer.start(this.state.remoteListenPort, this.state.remoteToken);
       const endpoints = this.formatHostEndpoints(port);
+      const callbackBaseUrl = this.preferredHubEndpoint(endpoints);
+      this.remoteCallbackBaseUrl = callbackBaseUrl;
+
+      if (this.state.remoteMode === 'client') {
+        if (hubUrl) {
+          const registered = await this.registerWithHub(callbackBaseUrl, false);
+          await this.refreshHubPeers();
+          this.scheduleRemoteHeartbeat(callbackBaseUrl, false);
+          const selected = this.state.remotePeerOptions.find((item) => item.id === this.state.remotePeerId);
+          this.state.remoteStatus =
+            `客户端模式 -> Hub ${hubUrl} / ${selected?.label || this.state.remotePeerId || '未选择节点'} / 节点数 ${this.state.remotePeerOptions.length}` +
+            ` / 回调 ${registered ? '已就绪' : '注册失败'} / ${tokenState}`;
+        } else {
+          await this.unregisterFromHub().catch(() => undefined);
+          this.stopRemoteHeartbeat();
+          this.state.remotePeerOptions = [];
+          this.state.remoteStatus = `客户端模式 -> ${this.state.remoteUrl || '未配置 URL'} / 回调 ${callbackBaseUrl} / ${tokenState}`;
+        }
+        await this.checkRemoteConnectivity();
+        this.state.remoteConnectionSnippet = this.buildRemoteConnectionSnippet();
+        return;
+      }
+
+      const availableTools = this.availableHostTools();
+      const selectedTool = this.selectedRemoteHostTool();
       let status = `主机模式已启动: ${endpoints.join(' , ')}`;
       if (hubUrl) {
-        const invokeBaseUrl = this.preferredHubEndpoint(endpoints);
-        const registered = await this.registerWithHub(invokeBaseUrl);
+        const registered = await this.registerWithHub(callbackBaseUrl, true);
         await this.refreshHubPeers();
-        this.scheduleRemoteHeartbeat(invokeBaseUrl);
+        this.scheduleRemoteHeartbeat(callbackBaseUrl, true);
         status += registered ? ` | Hub 已注册: ${hubUrl}` : ` | Hub 注册失败: ${hubUrl}`;
       } else {
+        await this.unregisterFromHub().catch(() => undefined);
         this.stopRemoteHeartbeat();
         this.state.remotePeerOptions = [];
       }
+      status += availableTools.length > 0
+        ? ` | 对外 CLI: ${selectedTool === 'claude' ? 'Claude Code' : 'Codex'}`
+        : ' | 未检测到本机可用 CLI';
       this.state.remoteStatus = `${status} | ${tokenState}`;
       this.state.remoteConnectivity = 'ok';
     } catch (err: any) {
+      this.remoteCallbackBaseUrl = '';
       this.stopRemoteHeartbeat();
       this.state.remoteStatus = `主机启动失败: ${err?.message || '未知错误'}`;
       this.state.remoteConnectivity = 'error';
@@ -1557,26 +2153,38 @@ class BridgeController {
     text: string,
     onDelta?: (delta: string) => void,
     onDone?: (text: string) => void,
-    override?: { tool?: CliTool; projectPath?: string; sessionId?: string }
+    override?: { tool?: LocalCliTool; projectPath?: string; sessionId?: string; sourceInterruptUrl?: string; sourceNodeId?: string }
   ): Promise<{ ok: true; text: string } | { ok: false; message: string }> {
-    const side = this.state.remoteExportSide;
-    const tool = override?.tool || this.selectedTool(side);
-    if (tool === 'remote') {
-      return { ok: false, message: `导出侧 ${side} 不能再指向 Remote` };
+    if (this.availableHostTools().length === 0) {
+      return { ok: false, message: '未检测到可用本地 CLI，请先安装 Codex 或 Claude Code。' };
     }
-
-    const projectPath = override?.projectPath || (side === 'A' ? this.state.projectAPath : this.state.projectBPath);
-    const sessionId = this.normalizedResumeId(
-      tool,
-      override?.sessionId ?? (side === 'A' ? this.state.sessionA : this.state.sessionB),
-      projectPath
-    );
+    const side = this.defaultInboundRemoteSide();
+    const tool = override?.tool || this.selectedInboundRemoteTool(side);
+    if (!this.availableHostTools().includes(tool)) {
+      return { ok: false, message: `本机未安装 ${tool === 'claude' ? 'Claude Code' : 'Codex'} CLI。` };
+    }
+    const projectPath = override?.projectPath || this.selectedInboundRemoteProjectPath(side);
+    const sessionId = override?.sessionId !== undefined
+      ? this.normalizedResumeId(tool, override.sessionId, projectPath)
+      : this.selectedInboundRemoteSessionId(side, tool, projectPath);
     const worker = this.workers[side][tool];
     if (!projectPath.trim()) {
       return { ok: false, message: `${side} 项目路径为空` };
     }
+    const cliFailure = this.localCliFailureMessage(tool);
+    if (cliFailure) {
+      return { ok: false, message: cliFailure };
+    }
     if (side === 'A' ? this.state.isSendingA : this.state.isSendingB) {
       return { ok: false, message: `${side} 当前忙碌中` };
+    }
+
+    if (override?.sourceNodeId?.trim()) {
+      this.lastRemoteInterruptPeer = { hubNodeId: override.sourceNodeId.trim() };
+      this.state.remotePeerLinked = true;
+    } else if (override?.sourceInterruptUrl?.trim()) {
+      this.lastRemoteInterruptPeer = { directInterruptUrl: override.sourceInterruptUrl.trim() };
+      this.state.remotePeerLinked = true;
     }
 
     const targetSummary = [tool, projectPath || '(未指定项目)', sessionId || 'new-session'].join(' / ');
@@ -1595,32 +2203,42 @@ class BridgeController {
     });
 
     return await new Promise((resolve) => {
-      worker.send(
-        this.composeOutboundMessage(text),
-        projectPath,
-        sessionId || undefined,
-        (delta) => {
-          this.appendAssistantDelta(assistantId, delta);
-          onDelta?.(delta);
-        },
-        (turnId, summaryIndex, delta) => {
-          this.bindTurnId(assistantId, turnId);
-          const key = `${side}|${turnId}|${summaryIndex}`;
-          this.reasoningMap.set(key, (this.reasoningMap.get(key) || '') + delta);
-          this.sync();
-        },
-        (result) => {
-          this.setSending(side, false);
-        if (!result.ok) {
-          this.appendSystem(`远端请求执行失败：${result.message}`, side, 'remote');
-          resolve({ ok: false, message: result.message });
-          return;
-        }
-          this.upsertAssistant(assistantId, result.text, side);
-          onDone?.(result.text);
-          resolve({ ok: true, text: result.text });
-        }
-      );
+      const runAttempt = (resumeId: string | undefined, allowRetryWithoutSession: boolean): void => {
+        worker.send(
+          this.composeOutboundMessage(text),
+          projectPath,
+          resumeId,
+          (delta) => {
+            this.appendAssistantDelta(assistantId, delta);
+            onDelta?.(delta);
+          },
+          (turnId, summaryIndex, delta) => {
+            this.bindTurnId(assistantId, turnId);
+            const key = `${side}|${turnId}|${summaryIndex}`;
+            this.reasoningMap.set(key, (this.reasoningMap.get(key) || '') + delta);
+            this.sync();
+          },
+          (result) => {
+            if (!result.ok && allowRetryWithoutSession && this.shouldRetryWithoutSession(tool, resumeId, result.message)) {
+              this.appendSystem('远端会话恢复失败，已自动切换为新会话重试', side, 'remote');
+              runAttempt(undefined, false);
+              return;
+            }
+
+            this.setSending(side, false);
+            if (!result.ok) {
+              this.appendSystem(`远端请求执行失败：${result.message}`, side, 'remote');
+              resolve({ ok: false, message: result.message });
+              return;
+            }
+            this.upsertAssistant(assistantId, result.text, side);
+            onDone?.(result.text);
+            resolve({ ok: true, text: result.text });
+          }
+        );
+      };
+
+      runAttempt(sessionId || undefined, !!sessionId);
     });
   }
 
@@ -1641,22 +2259,18 @@ class BridgeController {
 
   private describeRemoteToken(): string {
     const token = this.state.remoteToken.trim();
-    if (!token) return '认证 Token 缺失';
-    if (token.length < 8) return '认证 Token 偏短';
-    return `认证 Token 已就绪 (${token.length} 字符)`;
+    if (!token) return '访问 Key 缺失';
+    if (token.length < 8) return '访问 Key 偏短';
+    return `访问 Key 已就绪 (${token.length} 字符)`;
   }
 
   private buildRemoteConnectionSnippet(): string {
-    const lines = ['# Codex Bridge Remote 连接配置'];
-    const exportSide = this.state.remoteExportSide;
-    const exportTool = this.selectedTool(exportSide);
-    const exportProjectPath = exportSide === 'A' ? this.state.projectAPath.trim() : this.state.projectBPath.trim();
-    const exportSessionId = this.normalizedResumeId(
-      exportTool,
-      exportSide === 'A' ? this.state.sessionA : this.state.sessionB,
-      exportProjectPath
-    );
-    if (this.state.remoteMode === 'host') {
+    const lines = ['# Agent Bridge Remote 连接配置'];
+    const isHost = this.state.remoteMode === 'host';
+    const exportTool = isHost ? this.selectedRemoteHostTool() : this.state.remoteTargetTool;
+    const exportProjectPath = isHost ? this.selectedRemoteHostProjectPath() : this.state.remoteTargetProjectPath.trim();
+    const exportSessionId = isHost ? this.selectedRemoteHostSessionId(this.selectedRemoteHostProjectPath()) : this.state.remoteTargetSessionId.trim();
+    if (isHost) {
       lines.push('mode=client');
       if (this.state.remoteHubUrl.trim()) {
         lines.push(`hubUrl=${this.state.remoteHubUrl.trim()}`);
@@ -1675,15 +2289,18 @@ class BridgeController {
     lines.push(`targetTool=${exportTool}`);
     if (exportProjectPath) lines.push(`targetProjectPath=${exportProjectPath}`);
     if (exportSessionId) lines.push(`targetSessionId=${exportSessionId}`);
-    lines.push(`targetLabel=${[this.state.remoteDeviceName.trim() || os.hostname(), exportTool, exportProjectPath || '(未指定项目)', exportSessionId || 'new-session'].join(' | ')}`);
+    const targetLabel = isHost
+      ? [this.state.remoteDeviceName.trim() || os.hostname(), exportTool, exportProjectPath || '(未指定项目)', exportSessionId || 'new-session'].join(' | ')
+      : (this.state.remoteTargetLabel || [exportTool, exportProjectPath || '(未指定项目)', exportSessionId || 'new-session'].join(' | '));
+    lines.push(`targetLabel=${targetLabel}`);
     return lines.join('\n');
   }
 
-  public applyRemoteConfigSnippet(raw: string): void {
-    this.applyRemoteConfigSnippetInternal(raw);
+  public applyRemoteConfigSnippet(raw: string): { ok: boolean; message: string } {
+    return this.applyRemoteConfigSnippetInternal(raw);
   }
 
-  private applyRemoteConfigSnippetInternal(raw: string): void {
+  private applyRemoteConfigSnippetInternal(raw: string): { ok: boolean; message: string } {
     const values = new Map<string, string>();
     for (const line of raw.split(/\r?\n/)) {
       const trimmed = line.trim();
@@ -1696,20 +2313,24 @@ class BridgeController {
       values.set(key, value);
     }
 
+    if (values.size === 0) {
+      return { ok: false, message: '没有识别到可用配置' };
+    }
+
     const mode = values.get('mode');
     if (mode === 'host' || mode === 'client' || mode === 'off') {
       this.state.remoteMode = this.normalizeRemoteMode(mode);
     }
-    if (values.has('remoteUrl')) this.state.remoteUrl = values.get('remoteUrl') || '';
-    if (values.has('hubUrl')) this.state.remoteHubUrl = values.get('hubUrl') || '';
-    if (values.has('peerId')) this.state.remotePeerId = values.get('peerId') || '';
+    this.state.remoteUrl = values.get('remoteUrl') || '';
+    this.state.remoteHubUrl = values.get('hubUrl') || '';
+    this.state.remotePeerId = values.get('peerId') || '';
     if (values.has('token')) this.state.remoteToken = this.normalizeRemoteToken(values.get('token'));
     if (values.get('targetTool') === 'codex' || values.get('targetTool') === 'claude') {
-      this.state.remoteTargetTool = values.get('targetTool') as CliTool;
+      this.state.remoteTargetTool = values.get('targetTool') as LocalCliTool;
     }
-    if (values.has('targetProjectPath')) this.state.remoteTargetProjectPath = values.get('targetProjectPath') || '';
-    if (values.has('targetSessionId')) this.state.remoteTargetSessionId = values.get('targetSessionId') || '';
-    if (values.has('targetLabel')) this.state.remoteTargetLabel = values.get('targetLabel') || '';
+    this.state.remoteTargetProjectPath = values.get('targetProjectPath') || '';
+    this.state.remoteTargetSessionId = values.get('targetSessionId') || '';
+    this.state.remoteTargetLabel = values.get('targetLabel') || '';
     if (this.state.toolA !== 'remote' && this.state.toolB !== 'remote') {
       const side = this.pickRemoteImportSide();
       if (side === 'A') {
@@ -1720,6 +2341,7 @@ class BridgeController {
         this.state.sessionB = '';
       }
     }
+    return { ok: true, message: '配置已应用' };
   }
 
   private async checkRemoteConnectivity(): Promise<void> {
@@ -1769,10 +2391,10 @@ class BridgeController {
     this.remoteHeartbeatTimer = null;
   }
 
-  private scheduleRemoteHeartbeat(invokeBaseUrl: string): void {
+  private scheduleRemoteHeartbeat(invokeBaseUrl: string, discoverable: boolean): void {
     this.stopRemoteHeartbeat();
     this.remoteHeartbeatTimer = setInterval(() => {
-      this.registerWithHub(invokeBaseUrl).catch(() => undefined);
+      this.registerWithHub(invokeBaseUrl, discoverable).catch(() => undefined);
     }, 20_000);
   }
 
@@ -1794,21 +2416,22 @@ class BridgeController {
     this.remotePeerRefreshTimer = null;
   }
 
-  private async registerWithHub(invokeBaseUrl: string): Promise<boolean> {
+  private async registerWithHub(invokeBaseUrl: string, discoverable: boolean): Promise<boolean> {
     const hubUrl = this.state.remoteHubUrl.trim();
-    const token = this.state.remoteToken.trim();
-    if (!hubUrl || !token) return false;
+    const accessToken = this.state.remoteToken.trim();
+    if (!hubUrl) return false;
 
     try {
       const response = await fetch(`${hubUrl.replace(/\/$/, '')}/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          token,
           nodeId: this.localRemoteNodeId,
           deviceName: this.state.remoteDeviceName.trim() || os.hostname(),
           invokeUrl: `${invokeBaseUrl.replace(/\/$/, '')}/invoke`,
-          exportSide: this.state.remoteExportSide
+          accessToken,
+          exportSide: this.state.remoteExportSide,
+          discoverable
         })
       });
       return response.ok;
@@ -1819,15 +2442,15 @@ class BridgeController {
 
   private async unregisterFromHub(): Promise<void> {
     const hubUrl = this.state.remoteHubUrl.trim();
-    const token = this.state.remoteToken.trim();
-    if (!hubUrl || !token) return;
+    const accessToken = this.state.remoteToken.trim();
+    if (!hubUrl) return;
     try {
       await fetch(`${hubUrl.replace(/\/$/, '')}/unregister`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          token,
-          nodeId: this.localRemoteNodeId
+          nodeId: this.localRemoteNodeId,
+          accessToken
         })
       });
     } catch {
@@ -1837,15 +2460,14 @@ class BridgeController {
 
   private async refreshHubPeers(): Promise<void> {
     const hubUrl = this.state.remoteHubUrl.trim();
-    const token = this.state.remoteToken.trim();
-    if (!hubUrl || !token) {
+    if (!hubUrl) {
       this.state.remotePeerOptions = [];
       return;
     }
 
     try {
       const response = await fetch(
-        `${hubUrl.replace(/\/$/, '')}/peers?token=${encodeURIComponent(token)}&selfId=${encodeURIComponent(this.localRemoteNodeId)}`
+        `${hubUrl.replace(/\/$/, '')}/peers?selfId=${encodeURIComponent(this.localRemoteNodeId)}`
       );
       if (!response.ok) {
         this.state.remotePeerOptions = [];
@@ -1881,18 +2503,18 @@ class BridgeController {
     if (!value) return '';
     if (['新会话', '新对话', 'new', 'new session'].includes(value.toLowerCase())) return '';
 
-    const matching = this.state.sessionOptions.find((item) =>
-      item.tool === tool &&
-      item.id === value &&
-      this.matchesProject(item.cwd || '', projectPath || '')
-    );
-    if (matching) return value;
-
-    if (tool === 'claude') {
-      return /^(urn:uuid:)?[0-9a-fA-F-]{36}$/.test(value) ? value : '';
+    const matchingEntries = this.state.sessionOptions.filter((item) => item.id === value);
+    if (matchingEntries.length > 0) {
+      const matching = matchingEntries.find((item) =>
+        item.tool === tool &&
+        this.matchesProject(item.cwd || '', projectPath || '')
+      );
+      return matching ? value : '';
     }
 
-    return /^(urn:uuid:)?[0-9a-fA-F-]{8,}$/.test(value) ? value : '';
+    return /^(urn:uuid:)?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(value)
+      ? value
+      : '';
   }
 
   private matchesProject(sessionCwd: string, projectPath: string): boolean {
@@ -1982,11 +2604,13 @@ class BridgeController {
   }
 
   private async loadCliOptions(): Promise<void> {
+    this.cliHealthCache.clear();
     const home = os.homedir();
     const codexDir = path.join(home, '.codex');
     const configPath = path.join(codexDir, 'config.toml');
     const historyPath = path.join(codexDir, 'history.jsonl');
     const claudeProjectsDir = path.join(home, '.claude', 'projects');
+    const availableHostTools = this.detectAvailableHostTools();
 
     const [projects, claudeProjects, codexSessions, claudeSessions] = await Promise.all([
       this.parseProjects(configPath),
@@ -2003,6 +2627,61 @@ class BridgeController {
     if (this.state.projectBPath?.trim()) mergedProjects.add(this.state.projectBPath.trim());
     this.state.projectOptions = [...mergedProjects].sort((a, b) => a.localeCompare(b));
     this.state.sessionOptions = [...codexSessions, ...claudeSessions];
+    this.state.availableHostTools = availableHostTools;
+    this.state.remoteHostTool = this.normalizeHostTool(this.state.remoteHostTool);
+  }
+
+  private detectAvailableHostTools(): LocalCliTool[] {
+    const tools: LocalCliTool[] = [];
+    if (this.isCodexCliAvailable()) tools.push('codex');
+    if (this.isClaudeCliAvailable()) tools.push('claude');
+    return tools;
+  }
+
+  private isCodexCliAvailable(): boolean {
+    return this.probeLocalCli('codex').ok;
+  }
+
+  private isClaudeCliAvailable(): boolean {
+    return this.probeLocalCli('claude').ok;
+  }
+
+  private localCliFailureMessage(tool: CliTool): string {
+    if (tool === 'remote') return '';
+    const result = this.probeLocalCli(tool);
+    return result.ok ? '' : result.message;
+  }
+
+  private probeLocalCli(tool: LocalCliTool): { ok: boolean; message: string } {
+    const cached = this.cliHealthCache.get(tool);
+    if (cached) return cached;
+
+    try {
+      const executable = tool === 'codex' ? resolveCodexExecutable() : resolveClaudeExecutable();
+      const probe = spawnSync(executable, ['--version'], {
+        encoding: 'utf8',
+        timeout: 8_000
+      });
+
+      if ((probe.status ?? 1) === 0) {
+        const result = { ok: true, message: '' };
+        this.cliHealthCache.set(tool, result);
+        return result;
+      }
+
+      const detail = `${probe.stderr || probe.stdout || ''}`.replace(/\s+/g, ' ').trim();
+      const prefix = tool === 'codex' ? 'Codex CLI 不可用' : 'Claude CLI 不可用';
+      const result = {
+        ok: false,
+        message: detail ? `${prefix}：${detail}` : `${prefix}：退出码 ${probe.status ?? 'unknown'}`
+      };
+      this.cliHealthCache.set(tool, result);
+      return result;
+    } catch (err: any) {
+      const result = { ok: false, message: err?.message || `${tool} CLI 不可用` };
+      this.cliHealthCache.set(tool, result);
+      return result;
+    }
   }
 
   private async parseProjects(configPath: string): Promise<string[]> {
@@ -2087,9 +2766,9 @@ class BridgeController {
     const files = await this.listJsonlFiles(claudeProjectsDir);
 
     for (const file of files) {
-      const head = await this.readFileHead(file, 24 * 1024);
+      const head = await this.readFileHead(file, 96 * 1024);
       if (!head) continue;
-      const lines = head.split(/\r?\n/).filter(Boolean).slice(0, 16);
+      const lines = head.split(/\r?\n/).filter(Boolean).slice(0, 96);
       let sessionId = '';
       let cwd = '';
       let preview = '(无首句)';
@@ -2104,18 +2783,16 @@ class BridgeController {
         }
         const candidateId = typeof obj.sessionId === 'string' ? obj.sessionId : '';
         if (candidateId) sessionId = candidateId;
-        if (!cwd && typeof obj.cwd === 'string') cwd = obj.cwd;
+        if (!cwd && typeof obj.cwd === 'string') cwd = obj.cwd.trim();
         if (!sortTs && typeof obj.timestamp === 'string') {
           const ts = Date.parse(obj.timestamp);
           if (Number.isFinite(ts)) sortTs = ts;
         }
-        if (
-          preview === '(无首句)' &&
-          obj.type === 'user' &&
-          typeof obj.message?.content === 'string' &&
-          obj.message.content.trim()
-        ) {
-          preview = this.firstLinePreview(obj.message.content);
+        if (preview === '(无首句)' && obj.type === 'user') {
+          const content = this.extractClaudeMessageText(obj.message?.content);
+          if (content) {
+            preview = this.firstLinePreview(content);
+          }
         }
       }
 
@@ -2124,6 +2801,9 @@ class BridgeController {
         if (base) sessionId = base;
       }
       if (!sessionId) continue;
+      if (!cwd) {
+        cwd = await this.resolveClaudeProjectPath(path.dirname(file));
+      }
       if (!sortTs) {
         try {
           sortTs = (await fs.stat(file)).mtimeMs;
@@ -2160,10 +2840,67 @@ class BridgeController {
     const projects = new Set<string>();
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
-      const decoded = this.decodeClaudeProjectName(entry.name);
+      const decoded = await this.resolveClaudeProjectPath(path.join(claudeProjectsDir, entry.name));
       if (decoded) projects.add(decoded);
     }
     return [...projects].sort((a, b) => a.localeCompare(b));
+  }
+
+  private async resolveClaudeProjectPath(projectDir: string): Promise<string> {
+    const cached = this.claudeProjectPathCache.get(projectDir);
+    if (cached) return cached;
+
+    const resolver = (async () => {
+      let entries: Dirent[];
+      try {
+        entries = await fs.readdir(projectDir, { withFileTypes: true });
+      } catch {
+        return this.decodeClaudeProjectName(path.basename(projectDir));
+      }
+
+      for (const entry of entries) {
+        if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
+        const head = await this.readFileHead(path.join(projectDir, entry.name), 64 * 1024);
+        if (!head) continue;
+        for (const line of head.split(/\r?\n/).filter(Boolean).slice(0, 64)) {
+          let obj: any;
+          try {
+            obj = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          if (typeof obj.cwd === 'string' && obj.cwd.trim()) {
+            return obj.cwd.trim();
+          }
+        }
+      }
+
+      return this.decodeClaudeProjectName(path.basename(projectDir));
+    })();
+
+    this.claudeProjectPathCache.set(projectDir, resolver);
+    return resolver;
+  }
+
+  private extractClaudeMessageText(content: unknown): string {
+    if (typeof content === 'string') {
+      return content.trim();
+    }
+    if (!Array.isArray(content)) return '';
+
+    const chunks = content
+      .map((item) => {
+        if (typeof item === 'string') return item;
+        if (item && typeof item === 'object' && typeof (item as { text?: unknown }).text === 'string') {
+          return String((item as { text: string }).text);
+        }
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+
+    return chunks;
   }
 
   private decodeClaudeProjectName(name: string): string {
@@ -2381,7 +3118,7 @@ function getHtml(webview: vscode.Webview): string {
   <meta charset="UTF-8" />
   <meta http-equiv="Content-Security-Policy" content="${csp}" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Codex Bridge</title>
+  <title>Agent Bridge</title>
   <style>
     :root {
       --bg: var(--vscode-editor-background);
@@ -2411,8 +3148,10 @@ function getHtml(webview: vscode.Webview): string {
         linear-gradient(180deg, color-mix(in srgb, var(--vscode-editor-background) 92%, black), var(--vscode-editor-background));
     }
     .tabbar {
-      display: inline-flex;
-      gap: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
       padding: 6px;
       margin-bottom: 14px;
       border-radius: 999px;
@@ -2423,6 +3162,12 @@ function getHtml(webview: vscode.Webview): string {
       top: 0;
       z-index: 2;
       backdrop-filter: blur(10px);
+    }
+    .tabbar-main,
+    .tabbar-side {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
     }
     .tab-btn {
       background: transparent;
@@ -2438,6 +3183,15 @@ function getHtml(webview: vscode.Webview): string {
       background: var(--accent);
       color: var(--accent-fg);
       border-color: color-mix(in srgb, var(--accent) 70%, white 30%);
+    }
+    .tab-btn.secondary {
+      background: color-mix(in srgb, var(--panel) 82%, transparent);
+      color: var(--vscode-foreground);
+      border-color: var(--border-soft);
+    }
+    .tab-btn:disabled {
+      opacity: 0.6;
+      cursor: default;
     }
     .tab-page { display: none; }
     .tab-page.active { display: block; }
@@ -2845,6 +3599,11 @@ function getHtml(webview: vscode.Webview): string {
       .tabbar {
         display: flex;
         width: 100%;
+        flex-wrap: wrap;
+      }
+      .tabbar-main,
+      .tabbar-side {
+        width: 100%;
       }
       .tab-btn { flex: 1 1 0; }
     }
@@ -2852,8 +3611,14 @@ function getHtml(webview: vscode.Webview): string {
 </head>
 <body>
   <div class="tabbar">
-    <button id="tabChat" class="tab-btn active" type="button" data-tab-target="chat">桥接对话</button>
-    <button id="tabRemote" class="tab-btn" type="button" data-tab-target="remote">远程对接</button>
+    <div class="tabbar-main">
+      <button id="tabChat" class="tab-btn active" type="button" data-tab-target="chat">桥接对话</button>
+      <button id="tabRemote" class="tab-btn" type="button" data-tab-target="remote">跟我的AI说去吧</button>
+    </div>
+    <div class="tabbar-side">
+      <span id="refreshOptionsStatus" class="hint"></span>
+      <button id="refreshOptions" class="tab-btn secondary" type="button">刷新项目/线程</button>
+    </div>
   </div>
 
   <div id="pageChat" class="tab-page active">
@@ -3032,8 +3797,8 @@ function getHtml(webview: vscode.Webview): string {
             </div>
             <div class="status-card">
               <div class="field">
-                <label for="remoteToken">认证 Token</label>
-                <input id="remoteToken" placeholder="认证 Token，用于远端/Hub 鉴权" />
+                <label for="remoteToken">访问 Key</label>
+                <input id="remoteToken" placeholder="当前连接/分享所使用的访问 Key" />
               </div>
               <div class="hint" id="remoteTokenHint" style="margin-top:8px;"></div>
             </div>
@@ -3117,21 +3882,11 @@ function getHtml(webview: vscode.Webview): string {
           <summary>
             <span class="summary-copy">
               <strong>复制远端连接配置</strong>
-              <span class="muted">带上导出的 CLI、项目路径和线程 ID，供对方一键接入。</span>
+              <span class="muted">直接镜像当前导出侧 A/B 的 CLI、项目路径和线程 ID，供对方一键接入。</span>
             </span>
           </summary>
           <div class="advanced-body stack">
             <div class="status-card">
-              <div class="dual-grid">
-                <div class="field">
-                  <label for="remoteShareSessionSelect">导出线程</label>
-                  <select id="remoteShareSessionSelect"></select>
-                </div>
-                <div class="field">
-                  <label for="remoteShareSessionInput">导出线程 ID 覆盖</label>
-                  <input id="remoteShareSessionInput" placeholder="留空时使用左侧选择；都留空则新会话" />
-                </div>
-              </div>
               <div class="hint" id="remoteShareSummary" style="margin-top:8px;"></div>
             </div>
             <div class="inline-actions">
@@ -3142,16 +3897,17 @@ function getHtml(webview: vscode.Webview): string {
           </div>
         </details>
 
-        <details id="remoteImportDetails" class="advanced-details client-only">
+        <details id="remoteImportDetails" class="advanced-details off-or-client">
           <summary>
             <span class="summary-copy">
               <strong>粘贴连接配置</strong>
-              <span class="muted">推荐优先使用。粘贴后会自动补全远端地址、Token 和目标线程。</span>
+              <span class="muted">推荐优先使用。粘贴后会自动补全远端地址、Token 和目标线程，也支持手动点击按钮再次应用。</span>
             </span>
           </summary>
           <div class="advanced-body stack">
             <div class="inline-actions">
               <button id="applyRemoteConfig" class="secondary">应用配置</button>
+              <span id="remoteImportStatus" class="hint"></span>
             </div>
             <textarea id="remoteConfigPaste" placeholder="把别人发给你的连接配置粘贴到这里，然后点“应用配置”"></textarea>
           </div>
@@ -3203,6 +3959,11 @@ function getHtml(webview: vscode.Webview): string {
     let isComposing = false;
     let compositionJustEndedAt = 0;
     let copyShareStatusTimer = null;
+    let refreshOptionsStatusTimer = null;
+    let refreshOptionsPending = false;
+    let remoteImportStatusTimer = null;
+    let remoteImportApplyTimer = null;
+    let lastAutoAppliedRemoteConfig = '';
     let activeTab = webviewState.activeTab === 'remote' ? 'remote' : 'chat';
 
     window.addEventListener('error', (event) => {
@@ -3238,7 +3999,11 @@ function getHtml(webview: vscode.Webview): string {
     function getRemoteSendTargets(state) {
       if (!state) return [];
       if (state.remoteMode === 'host') {
-        return state.remoteExportSide ? [{ side: state.remoteExportSide, label: '发给本机 AI' }] : [];
+        const targets = state.remoteExportSide ? [{ id: 'LOCAL', label: '发给本机 AI' }] : [];
+        if (state.remotePeerLinked) {
+          targets.push({ id: 'REMOTE', label: '发给远端 AI' });
+        }
+        return targets;
       }
 
       const remoteSides = getRemoteConversationSides(state);
@@ -3248,13 +4013,13 @@ function getHtml(webview: vscode.Webview): string {
         const localTool = localSide === 'A' ? state.toolA : state.toolB;
         if (localTool !== 'remote') {
           return [
-            { side: localSide, label: '发给本机 AI' },
-            { side: remoteSide, label: '发给远端 AI' }
+            { id: 'LOCAL', label: '发给本机 AI' },
+            { id: 'REMOTE', label: '发给远端 AI' }
           ];
         }
       }
 
-      return remoteSides.map((side) => ({ side, label: '发给 Remote ' + side }));
+      return remoteSides.map((side) => ({ id: side, label: '发给 Remote ' + side }));
     }
 
     function getRemoteDefaultTarget(state) {
@@ -3271,7 +4036,9 @@ function getHtml(webview: vscode.Webview): string {
         return '当前没有可用的跨设备对话流';
       }
       if (state.remoteMode === 'host') {
-        return '当前作为主机导出本机 ' + sides[0] + '，远端发来的消息和本机插话都会落在这条共享线程里';
+        return state.remotePeerLinked
+          ? ('当前作为主机导出本机 ' + sides[0] + '，现在可以像客户端一样分别发给本机 AI 或远端 AI')
+          : ('当前作为主机导出本机 ' + sides[0] + '，先等待远端接入，接入后双方按钮会保持一致');
       }
       if (state.remoteAutoRelayEnabled) {
         return '已开启自动接力，本机 AI 和远端 AI 会按回复继续对话，直到你手动停止或命中阶段完成标记';
@@ -3316,9 +4083,9 @@ function getHtml(webview: vscode.Webview): string {
       const first = targets[0] || null;
       const second = targets[1] || null;
       $('remoteSendA').textContent = first ? first.label : '发给对话方';
-      $('remoteSendA').dataset.target = first ? first.side : '';
+      $('remoteSendA').dataset.target = first ? first.id : '';
       $('remoteSendB').textContent = second ? second.label : '发给第二对话方';
-      $('remoteSendB').dataset.target = second ? second.side : '';
+      $('remoteSendB').dataset.target = second ? second.id : '';
       $('remoteSendBoth').textContent = '同时发给双方';
       $('remoteSendA').classList.toggle('hidden', !first);
       $('remoteSendB').classList.toggle('hidden', !second);
@@ -3348,35 +4115,28 @@ function getHtml(webview: vscode.Webview): string {
     }
 
     function renderRemoteShareSessionMirror() {
-      const mirrorSelect = $('remoteShareSessionSelect');
-      const mirrorInput = $('remoteShareSessionInput');
       const summary = $('remoteShareSummary');
-      if (!mirrorSelect || !mirrorInput || !summary) return;
+      if (!summary) return;
 
       const side = currentExportSide();
       const ids = getSideControlIds(side);
-      const sourceSelect = $(ids.sessionSelect);
-      const sourceInput = $(ids.sessionInput);
-      const tool = $(ids.tool).value || 'codex';
-      const projectPath = $(ids.projectInput).value.trim() || $(ids.projectSelect).value || '';
-
-      mirrorSelect.innerHTML = '';
-      for (const option of Array.from(sourceSelect.options)) {
-        mirrorSelect.appendChild(option.cloneNode(true));
+      const tool = $(ids.tool).value || (latestState && (side === 'A' ? latestState.toolA : latestState.toolB)) || 'codex';
+      const toolLabel = tool === 'claude' ? 'Claude Code' : 'Codex';
+      const currentProjectValue = $(ids.projectInput).value.trim() || $(ids.projectSelect).value || '';
+      const currentSessionValue = $(ids.sessionInput).value.trim() || $(ids.sessionSelect).value || '';
+      if (tool === 'remote') {
+        summary.textContent = '当前导出侧是 Remote，本机无法直接对外提供该侧。请切换到配置了 Codex 或 Claude Code 的一侧。';
+        return;
       }
-
-      const manualValue = sourceInput.value.trim();
-      mirrorInput.value = sourceInput.value || '';
-      mirrorSelect.value = manualValue ? '' : (sourceSelect.value || '');
       summary.textContent =
-        '当前复制将导出 ' +
+        '当前会直接镜像 ' +
         side +
         ' · ' +
-        tool +
+        toolLabel +
         ' · ' +
-        (projectPath || '未指定项目') +
+        (currentProjectValue || '未指定项目') +
         ' · ' +
-        (manualValue || mirrorSelect.value || 'new-session');
+        (currentSessionValue || 'new-session');
     }
 
     function setCopyShareStatus(text) {
@@ -3393,6 +4153,97 @@ function getHtml(webview: vscode.Webview): string {
           copyShareStatusTimer = null;
         }, 1800);
       }
+    }
+
+    function setRefreshOptionsStatus(text, isError = false) {
+      const status = $('refreshOptionsStatus');
+      if (!status) return;
+      status.textContent = text || '';
+      status.style.color = isError
+        ? 'var(--vscode-errorForeground)'
+        : 'var(--vscode-descriptionForeground)';
+      if (refreshOptionsStatusTimer) {
+        clearTimeout(refreshOptionsStatusTimer);
+        refreshOptionsStatusTimer = null;
+      }
+      if (text) {
+        refreshOptionsStatusTimer = setTimeout(() => {
+          status.textContent = '';
+          refreshOptionsStatusTimer = null;
+        }, 1800);
+      }
+    }
+
+    function setRefreshOptionsPending(pending) {
+      refreshOptionsPending = !!pending;
+      const button = $('refreshOptions');
+      if (!button) return;
+      button.disabled = refreshOptionsPending;
+      button.textContent = refreshOptionsPending ? '刷新中...' : '刷新项目/线程';
+    }
+
+    function setRemoteImportStatus(text, isError = false) {
+      const status = $('remoteImportStatus');
+      if (!status) return;
+      status.textContent = text || '';
+      status.style.color = isError
+        ? 'var(--vscode-errorForeground)'
+        : 'var(--vscode-descriptionForeground)';
+      if (remoteImportStatusTimer) {
+        clearTimeout(remoteImportStatusTimer);
+        remoteImportStatusTimer = null;
+      }
+      if (text) {
+        remoteImportStatusTimer = setTimeout(() => {
+          status.textContent = '';
+          status.style.color = 'var(--vscode-descriptionForeground)';
+          remoteImportStatusTimer = null;
+        }, isError ? 3200 : 2200);
+      }
+    }
+
+    function looksLikeRemoteConfig(text) {
+      return /(^|\\n)\s*[A-Za-z][A-Za-z0-9_-]*\s*=/.test(text || '');
+    }
+
+    function applyRemoteConfig(source = 'manual') {
+      const text = $('remoteConfigPaste').value || '';
+      if (!text.trim()) {
+        setRemoteImportStatus('请先粘贴连接配置', true);
+        return;
+      }
+      if (!looksLikeRemoteConfig(text)) {
+        if (source === 'manual') {
+          setRemoteImportStatus('没有识别到可用配置', true);
+        }
+        return;
+      }
+      if (source === 'auto') {
+        if (text === lastAutoAppliedRemoteConfig) return;
+        setRemoteImportStatus('检测到配置，正在自动应用...');
+      } else {
+        setRemoteImportStatus('正在应用配置...');
+      }
+      lastAutoAppliedRemoteConfig = text;
+      vscode.postMessage({ type: 'applyRemoteConfigSnippet', text, source });
+      setActiveTab('remote');
+    }
+
+    function scheduleAutoApplyRemoteConfig() {
+      if (remoteImportApplyTimer) {
+        clearTimeout(remoteImportApplyTimer);
+        remoteImportApplyTimer = null;
+      }
+      const text = $('remoteConfigPaste').value || '';
+      if (!text.trim()) {
+        lastAutoAppliedRemoteConfig = '';
+        setRemoteImportStatus('');
+        return;
+      }
+      remoteImportApplyTimer = setTimeout(() => {
+        remoteImportApplyTimer = null;
+        applyRemoteConfig('auto');
+      }, 260);
     }
 
     function syncSettings() {
@@ -3459,24 +4310,46 @@ function getHtml(webview: vscode.Webview): string {
       el.addEventListener('change', syncSettings);
       el.addEventListener('input', syncSettings);
     }
+    for (const side of ['A', 'B']) {
+      const ids = getSideControlIds(side);
+      $(ids.projectSelect).addEventListener('change', () => {
+        $(ids.projectInput).value = $(ids.projectSelect).value || '';
+        $(ids.sessionInput).value = '';
+        $(ids.sessionSelect).value = '';
+        renderRemoteShareSessionMirror();
+        syncSettings();
+      });
+      $(ids.projectInput).addEventListener('input', () => {
+        if ($(ids.projectInput).value.trim()) {
+          $(ids.projectSelect).value = '';
+          $(ids.sessionInput).value = '';
+          $(ids.sessionSelect).value = '';
+        }
+        renderRemoteShareSessionMirror();
+      });
+      $(ids.sessionSelect).addEventListener('change', () => {
+        $(ids.sessionInput).value = $(ids.sessionSelect).value || '';
+        renderRemoteShareSessionMirror();
+        syncSettings();
+      });
+      $(ids.sessionInput).addEventListener('input', () => {
+        if ($(ids.sessionInput).value.trim() && $(ids.sessionInput).value.trim() !== $(ids.sessionSelect).value) {
+          $(ids.sessionSelect).value = '';
+        }
+        renderRemoteShareSessionMirror();
+      });
+    }
     $('bridgeControls').addEventListener('toggle', syncSettings);
     $('remoteExportSide').addEventListener('change', () => {
       renderRemoteShareSessionMirror();
-    });
-    $('remoteShareSessionSelect').addEventListener('change', () => {
-      const ids = getSideControlIds(currentExportSide());
-      $(ids.sessionInput).value = '';
-      $(ids.sessionSelect).value = $('remoteShareSessionSelect').value || '';
-      renderRemoteShareSessionMirror();
       syncSettings();
     });
-    $('remoteShareSessionInput').addEventListener('input', () => {
-      const ids = getSideControlIds(currentExportSide());
-      $(ids.sessionInput).value = $('remoteShareSessionInput').value || '';
-      if ($('remoteShareSessionInput').value.trim()) {
-        $(ids.sessionSelect).value = '';
-      }
-      renderRemoteShareSessionMirror();
+    $('remoteTargetTool').addEventListener('change', () => {
+      $('remoteTargetSessionId').value = '';
+      syncSettings();
+    });
+    $('remoteTargetProjectPath').addEventListener('input', () => {
+      $('remoteTargetSessionId').value = '';
       syncSettings();
     });
 
@@ -3511,6 +4384,12 @@ function getHtml(webview: vscode.Webview): string {
     $('refreshRemotePeers').addEventListener('click', () => {
       vscode.postMessage({ type: 'refreshRemotePeers' });
     });
+    $('refreshOptions').addEventListener('click', () => {
+      if (refreshOptionsPending) return;
+      setRefreshOptionsPending(true);
+      setRefreshOptionsStatus('正在刷新...');
+      vscode.postMessage({ type: 'refreshOptions' });
+    });
     $('copyShareLink').addEventListener('click', async () => {
       const text = $('remoteConnectionSnippet').value || '';
       if (!text.trim()) {
@@ -3528,8 +4407,15 @@ function getHtml(webview: vscode.Webview): string {
       vscode.postMessage({ type: 'copyShareLink', text });
     });
     $('applyRemoteConfig').addEventListener('click', () => {
-      vscode.postMessage({ type: 'applyRemoteConfigSnippet', text: $('remoteConfigPaste').value || '' });
-      setActiveTab('remote');
+      applyRemoteConfig('manual');
+    });
+    $('remoteConfigPaste').addEventListener('input', () => {
+      scheduleAutoApplyRemoteConfig();
+    });
+    $('remoteConfigPaste').addEventListener('paste', () => {
+      setTimeout(() => {
+        scheduleAutoApplyRemoteConfig();
+      }, 0);
     });
     $('tabChat').addEventListener('click', () => setActiveTab('chat'));
     $('tabRemote').addEventListener('click', () => setActiveTab('remote'));
@@ -3588,6 +4474,20 @@ function getHtml(webview: vscode.Webview): string {
       }
       if (msg.type === 'copyShareLinkResult') {
         setCopyShareStatus(msg.ok ? '已复制' : ('复制失败：' + (msg.message || '未知错误')));
+        return;
+      }
+      if (msg.type === 'refreshOptionsResult') {
+        setRefreshOptionsPending(false);
+        setRefreshOptionsStatus(msg.ok ? '已刷新' : ('刷新失败：' + (msg.message || '未知错误')), !msg.ok);
+        return;
+      }
+      if (msg.type === 'applyRemoteConfigResult') {
+        setRemoteImportStatus(
+          msg.ok
+            ? (msg.source === 'auto' ? '已自动应用配置' : '配置已应用')
+            : ('应用失败：' + (msg.message || '未知错误')),
+          !msg.ok
+        );
       }
     });
 
@@ -3625,8 +4525,18 @@ function getHtml(webview: vscode.Webview): string {
       dot.className = 'status-dot ' + (latestState.remoteConnectivity || 'idle');
       updateRemoteModeUI();
       renderRemotePeerOptions(latestState.remotePeerOptions || [], latestState.remotePeerId || '');
-      renderProjectOptions('projectASelect', latestState.projectOptions || [], latestState.projectAPath || '', '选择 Project A');
-      renderProjectOptions('projectBSelect', latestState.projectOptions || [], latestState.projectBPath || '', '选择 Project B');
+      renderProjectOptions(
+        'projectASelect',
+        getProjectOptionsForTool(latestState, latestState.toolA || 'codex'),
+        latestState.projectAPath || '',
+        '选择 Project A'
+      );
+      renderProjectOptions(
+        'projectBSelect',
+        getProjectOptionsForTool(latestState, latestState.toolB || 'codex'),
+        latestState.projectBPath || '',
+        '选择 Project B'
+      );
       renderSessionOptions(
         latestState.sessionOptions || [],
         latestState.projectAPath || '',
@@ -3679,7 +4589,7 @@ function getHtml(webview: vscode.Webview): string {
         const isRemotePeer = item.peer === 'remote';
         return {
           side: isRemotePeer ? 'REMOTE' : 'LOCAL',
-          role: item.role.toUpperCase(),
+          role: '',
           sideClass: isRemotePeer ? 'msg-b' : 'msg-a',
           badgeClass: isRemotePeer ? 'badge badge-b' : 'badge'
         };
@@ -3705,7 +4615,7 @@ function getHtml(webview: vscode.Webview): string {
         div.innerHTML =
           '<div class=\"meta\">' +
           '<span class=\"' + appearance.badgeClass + '\">' + side + '</span>' +
-          '<span>' + role + '</span>' +
+          (view === 'remote' || !role ? '' : ('<span>' + role + '</span>')) +
           '<span>' + t + '</span>' +
           '</div>';
 
@@ -3740,8 +4650,10 @@ function getHtml(webview: vscode.Webview): string {
       const mode = $('remoteMode').value || 'off';
       const hostOnly = document.querySelectorAll('.host-only');
       const clientOnly = document.querySelectorAll('.client-only');
+      const offOrClient = document.querySelectorAll('.off-or-client');
       hostOnly.forEach((el) => el.classList.toggle('hidden', mode !== 'host'));
       clientOnly.forEach((el) => el.classList.toggle('hidden', mode !== 'client'));
+      offOrClient.forEach((el) => el.classList.toggle('hidden', mode === 'host'));
     }
 
     function renderProjectOptions(selectId, options, selectedValue, placeholder) {
@@ -3759,6 +4671,26 @@ function getHtml(webview: vscode.Webview): string {
         select.appendChild(opt);
       }
       select.value = selectedValue && options.includes(selectedValue) ? selectedValue : '';
+    }
+
+    function getProjectOptionsForTool(state, tool) {
+      if (!state) return [];
+      if (tool === 'remote') return [];
+      const ignored = new Set([
+        '/Users/wulingren',
+        '/Users/wulingren/.claude',
+        '/Users/wulingren/.codex'
+      ]);
+      if (tool === 'claude') {
+        const values = new Set();
+        for (const item of state.sessionOptions || []) {
+          if (item.tool !== 'claude') continue;
+          const cwd = (item.cwd || '').trim();
+          if (cwd && !ignored.has(cwd)) values.add(cwd);
+        }
+        return [...values].sort((a, b) => a.localeCompare(b));
+      }
+      return (state.projectOptions || []).filter((item) => !ignored.has(item));
     }
 
     function renderRemotePeerOptions(options, selectedValue) {
@@ -3846,6 +4778,7 @@ function getHtml(webview: vscode.Webview): string {
     }
 
     setActiveTab(activeTab);
+    setRefreshOptionsPending(false);
     vscode.postMessage({ type: 'requestState' });
   </script>
 </body>

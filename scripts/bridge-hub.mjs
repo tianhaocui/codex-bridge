@@ -12,13 +12,7 @@ function readArg(name, fallback) {
 
 const port = Number.parseInt(readArg('port', process.env.BRIDGE_HUB_PORT || '9239'), 10);
 const host = readArg('host', process.env.BRIDGE_HUB_HOST || '0.0.0.0');
-const token = readArg('token', process.env.BRIDGE_HUB_TOKEN || '');
 const ttlMs = Number.parseInt(readArg('ttl', process.env.BRIDGE_HUB_TTL_MS || '45000'), 10);
-
-if (!token) {
-  console.error('缺少 hub token。请通过 --token 或 BRIDGE_HUB_TOKEN 提供。');
-  process.exit(1);
-}
 
 const peers = new Map();
 
@@ -69,8 +63,11 @@ async function pipeWebStreamToNodeResponse(body, res) {
   res.end();
 }
 
-function requireToken(candidate) {
-  return typeof candidate === 'string' && candidate === token;
+function requirePeerAccessToken(peer, candidate) {
+  if (!peer) return false;
+  const expected = typeof peer.accessToken === 'string' ? peer.accessToken.trim() : '';
+  if (!expected) return true;
+  return typeof candidate === 'string' && candidate === expected;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -91,10 +88,6 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && url.pathname === '/register') {
     try {
       const body = await readJsonBody(req);
-      if (!requireToken(body.token)) {
-        sendJson(res, 401, { ok: false, message: 'invalid token' });
-        return;
-      }
       if (typeof body.nodeId !== 'string' || !body.nodeId.trim()) {
         sendJson(res, 400, { ok: false, message: 'nodeId required' });
         return;
@@ -107,7 +100,9 @@ const server = http.createServer(async (req, res) => {
         nodeId: body.nodeId,
         deviceName: typeof body.deviceName === 'string' && body.deviceName.trim() ? body.deviceName.trim() : body.nodeId,
         invokeUrl: body.invokeUrl.trim(),
+        accessToken: typeof body.accessToken === 'string' ? body.accessToken.trim() : '',
         exportSide: typeof body.exportSide === 'string' ? body.exportSide : '',
+        discoverable: body.discoverable !== false,
         lastSeenAt: Date.now()
       });
       sendJson(res, 200, { ok: true, nodeId: body.nodeId, ttlMs });
@@ -118,13 +113,9 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'GET' && url.pathname === '/peers') {
-    if (!requireToken(url.searchParams.get('token'))) {
-      sendJson(res, 401, { ok: false, message: 'invalid token' });
-      return;
-    }
     const selfId = url.searchParams.get('selfId') || '';
     const list = [...peers.values()]
-      .filter((peer) => peer.nodeId !== selfId)
+      .filter((peer) => peer.nodeId !== selfId && peer.discoverable !== false)
       .sort((a, b) => b.lastSeenAt - a.lastSeenAt)
       .map((peer) => ({
         nodeId: peer.nodeId,
@@ -138,10 +129,6 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'GET' && url.pathname === '/relay/health') {
-    if (!requireToken(url.searchParams.get('token'))) {
-      sendJson(res, 401, { ok: false, message: 'invalid token' });
-      return;
-    }
     const targetNodeId = (url.searchParams.get('targetNodeId') || '').trim();
     if (!targetNodeId) {
       sendJson(res, 400, { ok: false, message: 'targetNodeId required' });
@@ -150,6 +137,10 @@ const server = http.createServer(async (req, res) => {
     const target = peers.get(targetNodeId);
     if (!target) {
       sendJson(res, 404, { ok: false, message: 'target node not found' });
+      return;
+    }
+    if (!requirePeerAccessToken(target, url.searchParams.get('token'))) {
+      sendJson(res, 401, { ok: false, message: 'invalid access token' });
       return;
     }
     try {
@@ -168,13 +159,14 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && url.pathname === '/unregister') {
     try {
       const body = await readJsonBody(req);
-      if (!requireToken(body.token)) {
-        sendJson(res, 401, { ok: false, message: 'invalid token' });
-        return;
-      }
       const nodeId = typeof body.nodeId === 'string' ? body.nodeId.trim() : '';
       if (!nodeId) {
         sendJson(res, 400, { ok: false, message: 'nodeId required' });
+        return;
+      }
+      const existing = peers.get(nodeId);
+      if (existing && !requirePeerAccessToken(existing, body.accessToken)) {
+        sendJson(res, 401, { ok: false, message: 'invalid access token' });
         return;
       }
       peers.delete(nodeId);
@@ -188,10 +180,6 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && (url.pathname === '/relay/invoke' || url.pathname === '/relay/interrupt')) {
     try {
       const body = await readJsonBody(req);
-      if (!requireToken(body.token)) {
-        sendJson(res, 401, { ok: false, message: 'invalid token' });
-        return;
-      }
       const targetNodeId = typeof body.targetNodeId === 'string' ? body.targetNodeId.trim() : '';
       if (!targetNodeId) {
         sendJson(res, 400, { ok: false, message: 'targetNodeId required' });
@@ -200,6 +188,10 @@ const server = http.createServer(async (req, res) => {
       const target = peers.get(targetNodeId);
       if (!target) {
         sendJson(res, 404, { ok: false, message: 'target node not found' });
+        return;
+      }
+      if (!requirePeerAccessToken(target, body.token)) {
+        sendJson(res, 401, { ok: false, message: 'invalid access token' });
         return;
       }
 
@@ -211,15 +203,17 @@ const server = http.createServer(async (req, res) => {
         method: 'POST',
         headers: url.pathname === '/relay/invoke'
           ? { 'Content-Type': 'application/json' }
-          : { 'x-bridge-token': token },
+          : { 'x-bridge-token': typeof target.accessToken === 'string' ? target.accessToken : '' },
         body: url.pathname === '/relay/invoke'
           ? JSON.stringify({
-              token,
+              token: typeof target.accessToken === 'string' ? target.accessToken : '',
               text: body.text || '',
               stream: body.stream !== false,
               targetTool: body.targetTool,
               targetProjectPath: body.targetProjectPath,
-              targetSessionId: body.targetSessionId
+              targetSessionId: body.targetSessionId,
+              sourceInterruptUrl: body.sourceInterruptUrl,
+              sourceNodeId: body.sourceNodeId
             })
           : undefined
       });

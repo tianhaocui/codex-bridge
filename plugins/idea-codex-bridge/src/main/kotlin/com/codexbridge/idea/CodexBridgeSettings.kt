@@ -10,11 +10,29 @@ import com.intellij.openapi.project.Project
 @State(name = "CodexBridgeSettings", storages = [Storage("codex-bridge.xml")])
 class CodexBridgeSettings : PersistentStateComponent<CodexBridgeSettings.State> {
     data class State(
+        var projectAPath: String = "",
         var projectBPath: String = "",
+        var toolA: String = "codex",
+        var toolB: String = "codex",
         var sessionA: String = "",
         var sessionB: String = "",
         var autoRelayEnabled: Boolean = false,
-        var stopOnStageDone: Boolean = true
+        var stopOnStageDone: Boolean = true,
+        var chatControlExpanded: Boolean = false,
+        var remoteControlExpanded: Boolean = false,
+        var remoteMode: String = "off",
+        var remoteUrl: String = "",
+        var remoteToken: String = "",
+        var remoteListenPort: Int = RemoteBridgeSupport.DEFAULT_REMOTE_PORT,
+        var remoteExportSide: String = "A",
+        var remoteHubUrl: String = "",
+        var remotePeerId: String = "",
+        var remoteDeviceName: String = "",
+        var remoteTargetTool: String = "codex",
+        var remoteTargetProjectPath: String = "",
+        var remoteTargetSessionId: String = "",
+        var remoteTargetLabel: String = "",
+        var remoteAutoRelayEnabled: Boolean = false
     )
 
     private var state = State()

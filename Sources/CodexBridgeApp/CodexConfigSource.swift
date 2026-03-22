@@ -20,6 +20,8 @@ struct SessionOption: Identifiable {
 }
 
 enum CodexConfigSource {
+    private static let maxSessionOptions = 80
+
     static func loadFromHomeCodex() throws -> CodexOptions {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let codexDir = URL(fileURLWithPath: home).appendingPathComponent(".codex")
@@ -59,38 +61,113 @@ enum CodexConfigSource {
             let text: String?
         }
 
-        let content = try String(contentsOfFile: path, encoding: .utf8)
         var latestTsBySession: [String: Int] = [:]
         var firstTextBySession: [String: String] = [:]
 
-        for line in content.split(separator: "\n") {
-            guard let data = line.data(using: .utf8),
-                  let item = try? JSONDecoder().decode(HistoryItem.self, from: data),
-                  !item.session_id.isEmpty else {
-                continue
+        if let content = try? String(contentsOfFile: path, encoding: .utf8) {
+            for line in content.split(separator: "\n") {
+                guard let data = line.data(using: .utf8),
+                      let item = try? JSONDecoder().decode(HistoryItem.self, from: data),
+                      !item.session_id.isEmpty else {
+                    continue
+                }
+                let ts = item.ts ?? 0
+                if firstTextBySession[item.session_id] == nil {
+                    let raw = item.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    firstTextBySession[item.session_id] = firstLinePreview(raw)
+                }
+                latestTsBySession[item.session_id] = max(ts, latestTsBySession[item.session_id] ?? ts)
             }
-            let ts = item.ts ?? 0
-            if firstTextBySession[item.session_id] == nil {
-                let raw = item.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                firstTextBySession[item.session_id] = firstLinePreview(raw)
-            }
-            latestTsBySession[item.session_id] = max(ts, latestTsBySession[item.session_id] ?? ts)
         }
 
-        let sortedIDs = latestTsBySession
-            .map { ($0.key, $0.value) }
-            .sorted { lhs, rhs in lhs.1 > rhs.1 }
-            .map(\.0)
-
-        if sortedIDs.isEmpty {
+        let metaEntries = parseSessionMetaEntries(codexDir: codexDir)
+        let mergedScores = mergedSessionScores(latestTsBySession: latestTsBySession, metaEntries: metaEntries)
+        let topIDs = mergedScores
+            .sorted { lhs, rhs in
+                if lhs.value == rhs.value {
+                    return lhs.key > rhs.key
+                }
+                return lhs.value > rhs.value
+            }
+            .prefix(maxSessionOptions)
+            .map(\.key)
+        if topIDs.isEmpty {
             return []
         }
 
-        let topIDs = Array(sortedIDs.prefix(80))
         let cwdBySession = parseSessionCwds(for: Set(topIDs), codexDir: codexDir)
+        let metaByID = Dictionary(uniqueKeysWithValues: metaEntries.map { ($0.id, $0) })
         return topIDs.map { sid in
-            SessionOption(id: sid, preview: firstTextBySession[sid] ?? "", cwd: cwdBySession[sid])
+            SessionOption(
+                id: sid,
+                preview: firstTextBySession[sid] ?? "",
+                cwd: cwdBySession[sid] ?? metaByID[sid]?.cwd
+            )
         }
+    }
+
+    private struct SessionMetaEntry {
+        let id: String
+        let cwd: String?
+        let sortTimestamp: TimeInterval
+    }
+
+    private static func parseSessionMetaEntries(codexDir: URL) -> [SessionMetaEntry] {
+        struct MetaEnvelope: Decodable {
+            let type: String
+            let payload: MetaPayload
+        }
+
+        struct MetaPayload: Decodable {
+            let id: String
+            let cwd: String?
+            let timestamp: String?
+        }
+
+        var byID: [String: SessionMetaEntry] = [:]
+        let roots = [
+            codexDir.appendingPathComponent("sessions"),
+            codexDir.appendingPathComponent("archived_sessions")
+        ]
+        let dateParserWithFraction = ISO8601DateFormatter()
+        dateParserWithFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let dateParser = ISO8601DateFormatter()
+        dateParser.formatOptions = [.withInternetDateTime]
+
+        for root in roots {
+            guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey]) else {
+                continue
+            }
+            for case let fileURL as URL in enumerator {
+                guard fileURL.pathExtension == "jsonl",
+                      let head = readFileHead(fileURL.path, maxBytes: 16_384) else {
+                    continue
+                }
+                let lines = head.split(separator: "\n", maxSplits: 12, omittingEmptySubsequences: true)
+                for line in lines {
+                    guard let data = line.data(using: .utf8),
+                          let meta = try? JSONDecoder().decode(MetaEnvelope.self, from: data),
+                          meta.type == "session_meta",
+                          !meta.payload.id.isEmpty else {
+                        continue
+                    }
+                    let fileMtime = (try? fileURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)?.timeIntervalSince1970 ?? 0
+                    let parsed = meta.payload.timestamp
+                        .flatMap { dateParserWithFraction.date(from: $0) ?? dateParser.date(from: $0) }?
+                        .timeIntervalSince1970
+                    let sortTimestamp = max(parsed ?? 0, fileMtime)
+                    let entry = SessionMetaEntry(id: meta.payload.id, cwd: meta.payload.cwd, sortTimestamp: sortTimestamp)
+
+                    if let existing = byID[entry.id], existing.sortTimestamp >= entry.sortTimestamp {
+                        break
+                    }
+                    byID[entry.id] = entry
+                    break
+                }
+            }
+        }
+
+        return byID.values.sorted { $0.sortTimestamp > $1.sortTimestamp }
     }
 
     private static func parseSessionCwds(for sessionIDs: Set<String>, codexDir: URL) -> [String: String] {
@@ -157,5 +234,19 @@ enum CodexConfigSource {
         }
         let idx = compact.index(compact.startIndex, offsetBy: 40)
         return String(compact[..<idx]) + "..."
+    }
+
+    private static func mergedSessionScores(
+        latestTsBySession: [String: Int],
+        metaEntries: [SessionMetaEntry]
+    ) -> [String: TimeInterval] {
+        var scores = latestTsBySession.reduce(into: [String: TimeInterval]()) { partialResult, entry in
+            partialResult[entry.key] = TimeInterval(entry.value)
+        }
+        for entry in metaEntries {
+            let existing = scores[entry.id] ?? 0
+            scores[entry.id] = max(existing, entry.sortTimestamp)
+        }
+        return scores
     }
 }
