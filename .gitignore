@@ -18,6 +18,7 @@ build/
 plugins/idea-codex-bridge/.gradle-home/
 plugins/idea-codex-bridge/.tooling/
 plugins/idea-codex-bridge/.intellij-local/
+plugins/idea-codex-bridge/.intellij-local-app/
 
 # Temporary generated schemas
 .tmp-schema/

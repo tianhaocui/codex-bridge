@@ -7,7 +7,7 @@ import com.intellij.openapi.wm.ToolWindowManager
 class OpenCodexBridgeAction : AnAction() {
     override fun actionPerformed(event: AnActionEvent) {
         val project = event.project ?: return
-        val toolWindow = ToolWindowManager.getInstance(project).getToolWindow("Codex Bridge") ?: return
+        val toolWindow = ToolWindowManager.getInstance(project).getToolWindow("Agent Bridge") ?: return
         toolWindow.show()
     }
 }

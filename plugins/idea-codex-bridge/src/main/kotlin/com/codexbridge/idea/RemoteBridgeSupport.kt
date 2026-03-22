@@ -72,7 +72,7 @@ data class RemoteSnippetContext(
 
 object RemoteBridgeSupport {
     const val DEFAULT_REMOTE_PORT = 9238
-    const val DEFAULT_REMOTE_TOKEN_HINT = "直连时，客户端与主机填同一个 Token；Hub 模式下，客户端、主机、Hub 都必须使用同一个 Token。"
+    const val DEFAULT_REMOTE_TOKEN_HINT = "访问 Key 用于远端鉴权。直连时与对方主机保持一致；Hub 模式下填写目标节点导出的访问 Key，Hub 自身不需要额外 Token。"
 
     fun defaultRemoteToken(): String = UUID.randomUUID().toString()
 
@@ -83,9 +83,9 @@ object RemoteBridgeSupport {
 
     fun describeRemoteToken(token: String): String {
         val trimmed = token.trim()
-        if (trimmed.isBlank()) return "认证 Token 缺失"
-        if (trimmed.length < 8) return "认证 Token 偏短"
-        return "认证 Token 已就绪 (${trimmed.length} 字符)"
+        if (trimmed.isBlank()) return "访问 Key 缺失"
+        if (trimmed.length < 8) return "访问 Key 偏短"
+        return "访问 Key 已就绪 (${trimmed.length} 字符)"
     }
 
     fun formatHostEndpoints(port: Int): List<String> {
@@ -127,7 +127,7 @@ object RemoteBridgeSupport {
     }
 
     fun buildConnectionSnippet(context: RemoteSnippetContext): String {
-        val lines = mutableListOf("# Codex Bridge Remote 连接配置")
+        val lines = mutableListOf("# Agent Bridge Remote 连接配置")
         if (context.currentMode == RemoteMode.HOST) {
             lines += "mode=client"
             if (context.remoteHubUrl.trim().isNotBlank()) {

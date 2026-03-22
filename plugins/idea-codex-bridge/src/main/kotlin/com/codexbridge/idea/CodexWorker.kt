@@ -86,7 +86,7 @@ class CodexWorker : BridgeWorker {
         startProcess()
 
         sendRequest("initialize", mapOf(
-            "clientInfo" to mapOf("name" to "codex-bridge-idea", "version" to "0.1.0"),
+            "clientInfo" to mapOf("name" to "agent-bridge-idea", "version" to "0.1.2"),
             "capabilities" to mapOf("experimentalApi" to true)
         ))
 

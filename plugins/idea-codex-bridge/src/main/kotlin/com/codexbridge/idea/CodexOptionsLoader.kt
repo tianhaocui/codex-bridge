@@ -17,6 +17,7 @@ data class CodexOptions(
 
 object CodexOptionsLoader {
     private const val MAX_SESSION_OPTIONS = 80
+    private const val MAX_CLAUDE_SCAN_LINES = 96
 
     fun load(projectAPath: String): CodexOptions {
         val home = System.getProperty("user.home").orEmpty()
@@ -38,6 +39,10 @@ object CodexOptionsLoader {
         )
     }
 
+    internal fun parseClaudeProjectsForTest(claudeProjectsDir: File): List<String> = parseClaudeProjects(claudeProjectsDir)
+
+    internal fun parseClaudeSessionsForTest(claudeProjectsDir: File): List<SessionOption> = parseClaudeSessions(claudeProjectsDir)
+
     private fun parseProjects(configPath: File): List<String> {
         if (!configPath.exists()) return emptyList()
         val regex = Regex("""^\s*\[projects\."(.+)"\]\s*$""")
@@ -56,10 +61,30 @@ object CodexOptionsLoader {
         claudeProjectsDir.listFiles()
             ?.filter { it.isDirectory && !it.name.startsWith(".") }
             ?.forEach { dir ->
-                val decoded = decodeClaudeProjectName(dir.name)
-                if (decoded.isNotBlank()) projects.add(decoded)
+                val resolved = resolveClaudeProjectPath(dir)
+                if (resolved.isNotBlank()) projects.add(resolved)
             }
         return projects.toList().sorted()
+    }
+
+    private fun resolveClaudeProjectPath(projectDir: File): String {
+        if (!projectDir.exists()) return decodeClaudeProjectName(projectDir.name)
+
+        val jsonlFiles = projectDir.listFiles()
+            ?.filter { it.isFile && it.extension == "jsonl" }
+            .orEmpty()
+            .sortedBy { it.name }
+
+        for (file in jsonlFiles) {
+            val lines = readHeadLines(file, 64)
+            for (line in lines) {
+                val obj = JsonUtil.parseObject(line) ?: continue
+                val cwd = obj["cwd"]?.toString().orEmpty().trim()
+                if (cwd.isNotBlank()) return cwd
+            }
+        }
+
+        return decodeClaudeProjectName(projectDir.name)
     }
 
     private fun decodeClaudeProjectName(name: String): String {
@@ -137,29 +162,37 @@ object CodexOptionsLoader {
     private fun parseClaudeSessions(claudeProjectsDir: File): List<SessionOption> {
         if (!claudeProjectsDir.exists()) return emptyList()
         data class ClaudeEntry(val id: String, val cwd: String, val preview: String, val sortTs: Long)
-        val byId = mutableMapOf<String, ClaudeEntry>()
 
+        val byId = linkedMapOf<String, ClaudeEntry>()
         claudeProjectsDir.walkTopDown()
             .filter { it.isFile && it.extension == "jsonl" }
             .forEach { file ->
-                val lines = file.useLines { seq -> seq.take(16).toList() }
+                val lines = readHeadLines(file, MAX_CLAUDE_SCAN_LINES)
+                if (lines.isEmpty()) return@forEach
+
                 var sessionId = ""
                 var cwd = ""
                 var preview = "(无首句)"
                 var sortTs = 0L
 
                 for (line in lines) {
-                    val obj = JsonUtil.parseObject(line.trim()) ?: continue
-                    val candidateId = obj["sessionId"]?.toString().orEmpty()
+                    val obj = JsonUtil.parseObject(line) ?: continue
+                    val candidateId = obj["sessionId"]?.toString().orEmpty().trim()
                     if (candidateId.isNotBlank()) sessionId = candidateId
-                    if (cwd.isBlank()) cwd = obj["cwd"]?.toString().orEmpty()
+
+                    if (cwd.isBlank()) {
+                        cwd = obj["cwd"]?.toString().orEmpty().trim()
+                    }
+
                     if (sortTs == 0L) {
                         sortTs = parseIsoToMillis(obj["timestamp"]?.toString())
                     }
+
                     if (preview == "(无首句)" && obj["type"]?.toString() == "user") {
-                        val message = obj["message"] as? Map<*, *>
-                        val content = message?.get("content")?.toString().orEmpty()
-                        if (content.isNotBlank()) preview = firstLinePreview(content)
+                        val content = extractClaudeMessageText((obj["message"] as? Map<*, *>)?.get("content"))
+                        if (content.isNotBlank()) {
+                            preview = firstLinePreview(content)
+                        }
                     }
                 }
 
@@ -167,7 +200,12 @@ object CodexOptionsLoader {
                     sessionId = file.nameWithoutExtension
                 }
                 if (sessionId.isBlank()) return@forEach
-                if (sortTs == 0L) sortTs = file.lastModified()
+                if (cwd.isBlank()) {
+                    cwd = resolveClaudeProjectPath(file.parentFile)
+                }
+                if (sortTs == 0L) {
+                    sortTs = file.lastModified()
+                }
 
                 val existing = byId[sessionId]
                 if (existing == null || sortTs > existing.sortTs) {
@@ -186,6 +224,26 @@ object CodexOptionsLoader {
                     tool = "claude"
                 )
             }
+    }
+
+    private fun extractClaudeMessageText(content: Any?): String {
+        return when (content) {
+            is String -> content.trim()
+            is List<*> -> content.joinToString("") { item ->
+                when (item) {
+                    is String -> item
+                    is Map<*, *> -> item["text"]?.toString().orEmpty()
+                    else -> ""
+                }
+            }.trim()
+            else -> ""
+        }
+    }
+
+    private fun readHeadLines(file: File, maxLines: Int): List<String> {
+        return runCatching {
+            file.useLines { seq -> seq.map { it.trim() }.filter { it.isNotEmpty() }.take(maxLines).toList() }
+        }.getOrDefault(emptyList())
     }
 
     private data class SessionMetaEntry(

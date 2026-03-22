@@ -1,0 +1,29 @@
+#!/usr/bin/env sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+GRADLE_HOME_DIR="$SCRIPT_DIR/.tooling/gradle-8.10.2"
+
+if [ ! -x "$GRADLE_HOME_DIR/bin/gradle" ]; then
+  echo "未找到内置 Gradle：$GRADLE_HOME_DIR/bin/gradle" >&2
+  exit 1
+fi
+
+has_arm64_java() {
+  [ -x "$1/bin/java" ] && file "$1/bin/java" 2>/dev/null | grep -q 'arm64'
+}
+
+if [ -z "${JAVA_HOME:-}" ] || ! has_arm64_java "$JAVA_HOME"; then
+  for candidate in "$HOME/Library/Java/JavaVirtualMachines"/*/Contents/Home "/Library/Java/JavaVirtualMachines"/*/Contents/Home; do
+    if has_arm64_java "$candidate"; then
+      JAVA_HOME="$candidate"
+      export JAVA_HOME
+      PATH="$JAVA_HOME/bin:$PATH"
+      export PATH
+      break
+    fi
+  done
+fi
+
+export GRADLE_USER_HOME="${GRADLE_USER_HOME:-$SCRIPT_DIR/.gradle-home}"
+exec "$GRADLE_HOME_DIR/bin/gradle" "$@"

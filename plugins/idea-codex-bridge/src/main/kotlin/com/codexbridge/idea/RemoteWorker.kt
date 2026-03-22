@@ -36,7 +36,7 @@ class RemoteWorker(
                 return@executeOnPooledThread
             }
             if (token.isBlank()) {
-                onDone(Result.failure(IllegalStateException("远端 Token 为空")))
+                onDone(Result.failure(IllegalStateException("远端访问 Key 为空")))
                 return@executeOnPooledThread
             }
 
