@@ -110,7 +110,7 @@ async function main() {
   const target = startMockTargetServer();
   await target.start();
 
-  const hub = spawn('node', ['/Users/wulingren/codex-bridge-macapp/scripts/bridge-hub.mjs', '--port', String(HUB_PORT), '--ttl', '2000'], {
+  const hub = spawn('node', ['/root/codex-bridge/scripts/bridge-hub.mjs', '--port', String(HUB_PORT), '--ttl', '2000'], {
     stdio: ['ignore', 'pipe', 'pipe']
   });
 

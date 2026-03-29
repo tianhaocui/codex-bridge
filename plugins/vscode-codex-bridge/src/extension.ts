@@ -5,6 +5,7 @@ import * as http from 'node:http';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { promises as fs, Dirent } from 'node:fs';
+import WebSocket from 'ws';
 import {
   composeOutboundMessage,
   DEFAULT_STAGE_DONE_MARKERS,
@@ -258,22 +259,176 @@ class RemoteInvokeServer {
   }
 }
 
+// HubWebSocketClient: replaces HTTP polling with a persistent WebSocket connection to the hub.
+// Peers connect TO the hub, solving NAT traversal — no inbound HTTP server needed.
+class HubWebSocketClient {
+  private ws: WebSocket | null = null;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private reconnectDelay = 2000;
+  private destroyed = false;
+
+  private readonly pendingInvokes = new Map<string, {
+    onDelta: (d: string) => void;
+    onDone: (r: { ok: true; text: string } | { ok: false; message: string }) => void;
+  }>();
+
+  constructor(
+    private readonly getConfig: () => {
+      hubUrl: string; token: string; nodeId: string;
+      exportSide: Side; deviceName: string; mode: RemoteMode; discoverable: boolean;
+    },
+    private readonly onInvoke: (payload: {
+      requestId: string; sourceNodeId?: string; text: string;
+      targetTool?: LocalCliTool; targetProjectPath?: string; targetSessionId?: string;
+    }) => void,
+    private readonly onInterrupt: (requestId: string) => void,
+    private readonly onPeers: (peers: Array<{ nodeId: string; deviceName: string; exportSide: string }>) => void,
+    private readonly onStatusChange: (status: string) => void
+  ) {}
+
+  connect(): void {
+    if (this.destroyed) return;
+    const cfg = this.getConfig();
+    const hubUrl = cfg.hubUrl.trim();
+    if (!hubUrl) return;
+    const wsUrl = hubUrl.replace(/^http/, 'ws');
+    try {
+      const ws = new WebSocket(wsUrl);
+      this.ws = ws;
+      ws.on('open', () => {
+        this.reconnectDelay = 2000;
+        ws.send(JSON.stringify({
+          type: 'register',
+          nodeId: cfg.nodeId,
+          token: cfg.token.trim(),
+          deviceName: cfg.deviceName.trim() || os.hostname(),
+          exportSide: cfg.exportSide,
+          discoverable: cfg.discoverable
+        }));
+        this.onStatusChange('connected');
+      });
+      ws.on('message', (data: Buffer) => {
+        let msg: any;
+        try { msg = JSON.parse(data.toString()); } catch { return; }
+        this.handleMessage(msg);
+      });
+      ws.on('close', () => {
+        this.ws = null;
+        this.onStatusChange('disconnected');
+        this.scheduleReconnect();
+      });
+      ws.on('error', () => {
+        this.ws = null;
+        this.scheduleReconnect();
+      });
+    } catch {
+      this.scheduleReconnect();
+    }
+  }
+
+  disconnect(): void {
+    this.destroyed = true;
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+    if (this.ws) { this.ws.close(); this.ws = null; }
+    for (const [, p] of this.pendingInvokes) {
+      p.onDone({ ok: false, message: 'hub disconnected' });
+    }
+    this.pendingInvokes.clear();
+  }
+
+  reconnect(): void {
+    this.destroyed = false;
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+    if (this.ws) { this.ws.close(); this.ws = null; }
+    this.connect();
+  }
+
+  isConnected(): boolean {
+    return this.ws !== null && this.ws.readyState === WebSocket.OPEN;
+  }
+
+  sendInvoke(
+    requestId: string, targetNodeId: string, token: string, text: string,
+    opts: { targetTool?: string; targetProjectPath?: string; targetSessionId?: string; sourceNodeId?: string },
+    onDelta: (d: string) => void,
+    onDone: (r: { ok: true; text: string } | { ok: false; message: string }) => void
+  ): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      onDone({ ok: false, message: 'hub 未连接' }); return;
+    }
+    this.pendingInvokes.set(requestId, { onDelta, onDone });
+    this.ws.send(JSON.stringify({ type: 'invoke', requestId, targetNodeId, token, text, ...opts }));
+  }
+
+  sendInterrupt(requestId: string, targetNodeId: string, token: string): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: 'interrupt', requestId, targetNodeId, token }));
+  }
+
+  sendDelta(requestId: string, delta: string): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: 'delta', requestId, delta }));
+  }
+
+  sendDone(requestId: string, text: string): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: 'done', requestId, text }));
+  }
+
+  sendError(requestId: string, message: string): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: 'error', requestId, message }));
+  }
+
+  private handleMessage(msg: any): void {
+    switch (msg.type) {
+      case 'registered': break;
+      case 'peers': this.onPeers(msg.peers || []); break;
+      case 'invoke': this.onInvoke(msg); break;
+      case 'interrupt': this.onInterrupt(msg.requestId); break;
+      case 'delta': {
+        const p = this.pendingInvokes.get(msg.requestId);
+        if (p) p.onDelta(msg.delta || '');
+        break;
+      }
+      case 'done': {
+        const p = this.pendingInvokes.get(msg.requestId);
+        if (p) { this.pendingInvokes.delete(msg.requestId); p.onDone({ ok: true, text: msg.text || '' }); }
+        break;
+      }
+      case 'error': {
+        const p = this.pendingInvokes.get(msg.requestId);
+        if (p) { this.pendingInvokes.delete(msg.requestId); p.onDone({ ok: false, message: msg.message || '远端错误' }); }
+        break;
+      }
+    }
+  }
+
+  private scheduleReconnect(): void {
+    if (this.destroyed) return;
+    if (this.reconnectTimer) return;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.reconnectDelay = Math.min(this.reconnectDelay * 2, 30000);
+      this.connect();
+    }, this.reconnectDelay);
+  }
+}
+
 class RemoteWorker implements BridgeWorker {
-  private abortController: AbortController | null = null;
+  private currentRequestId: string | null = null;
 
   constructor(
     private readonly getConfig: () => {
       mode: RemoteMode;
-      url: string;
       token: string;
-      hubUrl: string;
       peerId: string;
       targetTool: LocalCliTool;
       targetProjectPath: string;
       targetSessionId: string;
-      sourceInterruptUrl?: string;
       sourceNodeId?: string;
-    }
+    },
+    private readonly hubClient: HubWebSocketClient
   ) {}
 
   async send(
@@ -289,92 +444,44 @@ class RemoteWorker implements BridgeWorker {
       onDone({ ok: false, message: '远端模式未切换到客户端' });
       return;
     }
-    const rawUrl = config.url.trim();
     const token = config.token.trim();
-    const hubUrl = config.hubUrl.trim();
     const peerId = config.peerId.trim();
-    if (!rawUrl && !(hubUrl && peerId)) {
-      onDone({ ok: false, message: '远端 URL 为空' });
+    if (!peerId) {
+      onDone({ ok: false, message: '未选择目标节点' });
       return;
     }
     if (!token) {
       onDone({ ok: false, message: '远端 Token 为空' });
       return;
     }
-
-    try {
-      this.abortController = new AbortController();
-      const request = hubUrl && peerId
-        ? {
-            url: `${hubUrl.replace(/\/$/, '')}/relay/invoke`,
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              token,
-              targetNodeId: peerId,
-              text: message,
-              stream: true,
-              targetTool: config.targetTool,
-              targetProjectPath: config.targetProjectPath,
-              targetSessionId: config.targetSessionId,
-              sourceNodeId: config.sourceNodeId
-            })
-          }
-        : {
-            url: RemoteWorker.resolveInvokeUrl(rawUrl),
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              token,
-              text: message,
-              stream: true,
-              targetTool: config.targetTool,
-              targetProjectPath: config.targetProjectPath,
-              targetSessionId: config.targetSessionId,
-              sourceInterruptUrl: config.sourceInterruptUrl
-            })
-          };
-      const response = await fetch(request.url, {
-        method: 'POST',
-        headers: request.headers,
-        body: request.body,
-        signal: this.abortController.signal
-      });
-      if (!response.ok) {
-        const text = await response.text();
-        this.abortController = null;
-        onDone({ ok: false, message: text || `远端调用失败 (${response.status})` });
-        return;
-      }
-      await RemoteWorker.consumeStreamingResponse(response, onDelta, onDone);
-      this.abortController = null;
-    } catch (err: any) {
-      this.abortController = null;
-      onDone({ ok: false, message: err?.message || '远端调用失败' });
-    }
+    const requestId = randomUUID();
+    this.currentRequestId = requestId;
+    this.hubClient.sendInvoke(
+      requestId, peerId, token, message,
+      {
+        targetTool: config.targetTool,
+        targetProjectPath: config.targetProjectPath,
+        targetSessionId: config.targetSessionId,
+        sourceNodeId: config.sourceNodeId
+      },
+      onDelta,
+      (result) => { this.currentRequestId = null; onDone(result); }
+    );
   }
 
   interrupt(): void {
-    this.abortController?.abort();
-    this.abortController = null;
-
     const config = this.getConfig();
     if (config.mode !== 'client' || !config.token.trim()) return;
-    const hubUrl = config.hubUrl.trim();
     const peerId = config.peerId.trim();
-    const directUrl = config.url.trim();
-    const interruptUrl = hubUrl && peerId
-      ? `${hubUrl.replace(/\/$/, '')}/relay/interrupt`
-      : RemoteWorker.resolveInterruptUrl(directUrl);
-    const body = hubUrl && peerId ? JSON.stringify({ token: config.token.trim(), targetNodeId: peerId }) : undefined;
-    fetch(interruptUrl, {
-      method: 'POST',
-      headers: hubUrl && peerId
-        ? { 'Content-Type': 'application/json' }
-        : { 'x-bridge-token': config.token.trim() },
-      body
-    }).catch(() => undefined);
+    if (!peerId) return;
+    const requestId = this.currentRequestId || randomUUID();
+    this.currentRequestId = null;
+    this.hubClient.sendInterrupt(requestId, peerId, config.token.trim());
   }
 
-  shutdown(): void {}
+  shutdown(): void {
+    this.currentRequestId = null;
+  }
 
   static async consumeStreamingResponse(
     response: Response,
@@ -1050,21 +1157,8 @@ class ClaudeWorker implements BridgeWorker {
     this.activeTurn = null;
     this.streamingText = '';
     this.reasoningText = '';
-    done({ ok: true, text });
   }
 
-  private failTurn(message: string): void {
-    if (!this.activeTurn) return;
-    const done = this.activeTurn.onDone;
-    this.activeTurn = null;
-    this.streamingText = '';
-    this.reasoningText = '';
-    done({ ok: false, message });
-  }
-
-  private cleanupProcess(): void {
-    if (this.process) {
-      this.process.stdout.removeAllListeners();
       this.process.stderr.removeAllListeners();
       this.process.removeAllListeners();
     }
@@ -1086,8 +1180,8 @@ class BridgeController {
   private static readonly maxSessionOptions = 80;
 
   private workers: Record<Side, Record<CliTool, BridgeWorker>> = {
-    A: { codex: new CodexWorker(), claude: new ClaudeWorker(), remote: new RemoteWorker(() => this.remoteConfig()) },
-    B: { codex: new CodexWorker(), claude: new ClaudeWorker(), remote: new RemoteWorker(() => this.remoteConfig()) }
+    A: { codex: new CodexWorker(), claude: new ClaudeWorker(), remote: new RemoteWorker(() => this.remoteConfig(), this.hubClient) },
+    B: { codex: new CodexWorker(), claude: new ClaudeWorker(), remote: new RemoteWorker(() => this.remoteConfig(), this.hubClient) }
   };
   private panel: vscode.WebviewPanel | null = null;
   private webview: vscode.Webview | null = null;
@@ -1100,16 +1194,33 @@ class BridgeController {
   private remoteHeartbeatTimer: NodeJS.Timeout | null = null;
   private remotePeerRefreshTimer: NodeJS.Timeout | null = null;
   private readonly localRemoteNodeId = randomUUID();
-  private remoteServer = new RemoteInvokeServer(
-    async ({ text, onDelta, onDone, targetTool, targetProjectPath, targetSessionId, sourceInterruptUrl, sourceNodeId }) =>
-      this.handleRemoteInvoke(text, onDelta, onDone, {
-        tool: targetTool,
-        projectPath: targetProjectPath,
-        sessionId: targetSessionId,
-        sourceInterruptUrl,
-        sourceNodeId
-      }),
-    async () => this.handleIncomingRemoteInterrupt()
+  private currentRemoteInvokeRequestId: string | null = null;
+  private hubClient = new HubWebSocketClient(
+    () => ({
+      hubUrl: this.state.remoteHubUrl,
+      token: this.state.remoteToken,
+      nodeId: this.localRemoteNodeId,
+      exportSide: this.state.remoteExportSide,
+      deviceName: this.state.remoteDeviceName,
+      mode: this.state.remoteMode,
+      discoverable: this.state.remoteMode === 'host'
+    }),
+    (payload) => this.handleRemoteInvokeWs(payload),
+    (requestId) => { this.currentRemoteInvokeRequestId = requestId; this.handleIncomingRemoteInterrupt(); },
+    (peers) => {
+      const options = peers
+        .filter((p) => p.nodeId)
+        .map((p) => ({ id: p.nodeId, label: [p.deviceName || p.nodeId, p.exportSide ? `导出${p.exportSide}` : ''].filter(Boolean).join(' · ') }));
+      this.state.remotePeerOptions = options;
+      if (!this.state.remotePeerId && options.length === 1) this.state.remotePeerId = options[0].id;
+      if (this.state.remotePeerId && !options.some((o) => o.id === this.state.remotePeerId)) this.state.remotePeerId = '';
+      this.sync();
+    },
+    (status) => {
+      this.state.remoteStatus = `WebSocket ${status} | Hub: ${this.state.remoteHubUrl}`;
+      this.sync();
+    }
+  );
   );
 
   private state: BridgeState = {
@@ -1187,9 +1298,7 @@ class BridgeController {
         this.workers[side][tool].shutdown();
       }
     }
-    this.remoteServer.stop().catch(() => undefined);
-    this.unregisterFromHub().catch(() => undefined);
-    this.stopRemoteHeartbeat();
+    this.hubClient.disconnect();
     this.stopRemotePeerRefreshLoop();
     this.panel = null;
     this.webview = null;
@@ -1626,141 +1735,36 @@ class BridgeController {
       return;
     }
 
-    const hubUrl = this.state.remoteHubUrl.trim();
-    const callbackUrl = this.remoteCallbackBaseUrl
-      ? `${this.remoteCallbackBaseUrl.replace(/\/$/, '')}/interrupt`
-      : undefined;
-
-    let requestUrl = '';
-    let requestHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
-    let requestBody = '';
-
-    if (peer.hubNodeId && hubUrl) {
-      requestUrl = `${hubUrl.replace(/\/$/, '')}/relay/invoke`;
-      requestBody = JSON.stringify({
-        token,
-        targetNodeId: peer.hubNodeId,
-        text: message,
-        stream: true,
-        sourceNodeId: this.localRemoteNodeId
-      });
-    } else if (peer.directInterruptUrl) {
-      requestUrl = RemoteWorker.resolveInvokeUrl(peer.directInterruptUrl);
-      requestBody = JSON.stringify({
-        token,
-        text: message,
-        stream: true,
-        sourceInterruptUrl: callbackUrl
-      });
-    } else {
+    if (!peer.hubNodeId) {
       this.appendSystem('当前还没有可用的远端回传地址', side, 'remote');
       return;
     }
 
     this.appendChat({
-      id: randomUUID(),
-      time: Date.now(),
-      side,
-      role: 'user',
-      text: message,
-      channel: 'remote',
-      peer: 'local'
+      id: randomUUID(), time: Date.now(), side, role: 'user',
+      text: message, channel: 'remote', peer: 'local'
     });
     this.setSending(side, true);
     const assistantId = randomUUID();
     this.appendChat({
-      id: assistantId,
-      time: Date.now(),
-      side,
-      role: 'assistant',
-      text: '',
-      channel: 'remote',
-      peer: 'remote'
+      id: assistantId, time: Date.now(), side, role: 'assistant',
+      text: '', channel: 'remote', peer: 'remote'
     });
 
-    fetch(requestUrl, {
-      method: 'POST',
-      headers: requestHeaders,
-      body: requestBody
-    })
-      .then(async (response) => {
-        if (!response.ok) {
-          const text = await response.text();
-          throw new Error(text || `远端调用失败 (${response.status})`);
-        }
-        await RemoteWorker.consumeStreamingResponse(
-          response,
-          (delta) => {
-            this.appendAssistantDelta(assistantId, delta);
-          },
-          (result) => {
-            this.setSending(side, false);
-            if (!result.ok) {
-              this.appendSystem(`远端发送失败：${result.message}`, side, 'remote');
-              return;
-            }
-            this.upsertAssistant(assistantId, result.text, side);
-          }
-        );
-      })
-      .catch((err: any) => {
+    const requestId = randomUUID();
+    this.hubClient.sendInvoke(
+      requestId, peer.hubNodeId, token, message,
+      { sourceNodeId: this.localRemoteNodeId },
+      (delta) => this.appendAssistantDelta(assistantId, delta),
+      (result) => {
         this.setSending(side, false);
-        this.appendSystem(`远端发送失败：${err?.message || '未知错误'}`, side, 'remote');
-      });
-  }
-
-  private async handleRemoteUiInterrupt(): Promise<void> {
-    const peerInterrupted = await this.propagateRemoteInterrupt();
-    const sides = this.remoteConversationSendSides();
-    let interruptedCount = 0;
-
-    for (const side of sides) {
-      const busy = side === 'A' ? this.state.isSendingA : this.state.isSendingB;
-      if (!busy) continue;
-      this.interruptedBySide[side] = true;
-      for (const tool of ['codex', 'claude', 'remote'] as const) {
-        this.workers[side][tool].interrupt();
+        if (!result.ok) {
+          this.appendSystem(`远端发送失败：${result.message}`, side, 'remote');
+          return;
+        }
+        this.upsertAssistant(assistantId, result.text, side);
       }
-      this.setSending(side, false);
-      interruptedCount += 1;
-    }
-
-    const hadRelay = this.state.remoteAutoRelayEnabled || this.state.autoRelayEnabled;
-    this.state.remoteAutoRelayEnabled = false;
-    this.state.autoRelayEnabled = false;
-    if (interruptedCount > 0 || hadRelay || peerInterrupted) {
-      this.appendSystem('已停止跨设备对话流，并关闭自动接力', undefined, 'remote');
-      this.sync();
-      return;
-    }
-    this.appendSystem('当前没有进行中的跨设备会话', undefined, 'remote');
-  }
-
-  private async handleIncomingRemoteInterrupt(): Promise<void> {
-    if (this.state.remoteMode === 'host') {
-      await this.handleRemoteInterrupt();
-      return;
-    }
-
-    const sides = this.remoteConversationSendSides();
-    let interruptedCount = 0;
-    for (const side of sides) {
-      const busy = side === 'A' ? this.state.isSendingA : this.state.isSendingB;
-      if (!busy) continue;
-      this.interruptedBySide[side] = true;
-      for (const tool of ['codex', 'claude', 'remote'] as const) {
-        this.workers[side][tool].interrupt();
-      }
-      this.setSending(side, false);
-      interruptedCount += 1;
-    }
-    const hadRelay = this.state.remoteAutoRelayEnabled || this.state.autoRelayEnabled;
-    this.state.remoteAutoRelayEnabled = false;
-    this.state.autoRelayEnabled = false;
-    if (interruptedCount > 0 || hadRelay) {
-      this.appendSystem('远端已请求停止，当前跨设备对话已打断', undefined, 'remote');
-      this.sync();
-    }
+    );
   }
 
   private async propagateRemoteInterrupt(): Promise<boolean> {
@@ -1768,65 +1772,22 @@ class BridgeController {
     if (!token) return false;
 
     if (this.state.remoteMode === 'client') {
-      const hubUrl = this.state.remoteHubUrl.trim();
       const peerId = this.state.remotePeerId.trim();
-      const directUrl = this.state.remoteUrl.trim();
-      if (!hubUrl && !directUrl) return false;
-      try {
-        if (hubUrl && peerId) {
-          const response = await fetch(`${hubUrl.replace(/\/$/, '')}/relay/interrupt`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ token, targetNodeId: peerId })
-          });
-          return response.ok;
-        }
-        if (directUrl) {
-          const response = await fetch(this.resolveDirectInterruptUrl(directUrl), {
-            method: 'POST',
-            headers: { 'x-bridge-token': token }
-          });
-          return response.ok;
-        }
-      } catch {
-        return false;
-      }
-      return false;
+      if (!peerId) return false;
+      const requestId = randomUUID();
+      this.hubClient.sendInterrupt(requestId, peerId, token);
+      return true;
     }
 
-    if (this.state.remoteMode !== 'host' || !this.lastRemoteInterruptPeer) return false;
-    try {
-      if (this.lastRemoteInterruptPeer.hubNodeId && this.state.remoteHubUrl.trim()) {
-        const response = await fetch(`${this.state.remoteHubUrl.trim().replace(/\/$/, '')}/relay/interrupt`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            token,
-            targetNodeId: this.lastRemoteInterruptPeer.hubNodeId
-          })
-        });
-        return response.ok;
-      }
-      if (this.lastRemoteInterruptPeer.directInterruptUrl) {
-        const response = await fetch(this.lastRemoteInterruptPeer.directInterruptUrl, {
-          method: 'POST',
-          headers: { 'x-bridge-token': token }
-        });
-        return response.ok;
-      }
-    } catch {
-      return false;
+    if (this.state.remoteMode === 'host' && this.lastRemoteInterruptPeer?.hubNodeId) {
+      const requestId = this.currentRemoteInvokeRequestId || randomUUID();
+      this.hubClient.sendInterrupt(requestId, this.lastRemoteInterruptPeer.hubNodeId, token);
+      return true;
     }
+
     return false;
   }
 
-  private resolveDirectInterruptUrl(rawUrl: string): string {
-    const trimmed = rawUrl.trim().replace(/\/$/, '');
-    if (!trimmed) return '/interrupt';
-    if (trimmed.endsWith('/interrupt')) return trimmed;
-    if (trimmed.endsWith('/invoke')) return trimmed.slice(0, -'/invoke'.length) + '/interrupt';
-    return `${trimmed}/interrupt`;
-  }
 
   private handleInterrupt(rawTarget: string): void {
     const target: 'A' | 'B' | 'BOTH' =
@@ -2030,38 +1991,28 @@ class BridgeController {
 
   private remoteConfig(): {
     mode: RemoteMode;
-    url: string;
     token: string;
-    hubUrl: string;
     peerId: string;
     targetTool: LocalCliTool;
     targetProjectPath: string;
     targetSessionId: string;
-    sourceInterruptUrl?: string;
     sourceNodeId?: string;
   } {
     return {
       mode: this.state.remoteMode,
-      url: this.state.remoteUrl,
       token: this.state.remoteToken,
-      hubUrl: this.state.remoteHubUrl,
       peerId: this.state.remotePeerId,
       targetTool: this.state.remoteTargetTool,
       targetProjectPath: this.state.remoteTargetProjectPath,
       targetSessionId: this.state.remoteTargetSessionId,
-      sourceInterruptUrl: this.state.remoteMode === 'client' && this.remoteCallbackBaseUrl
-        ? `${this.remoteCallbackBaseUrl.replace(/\/$/, '')}/interrupt`
-        : undefined,
-      sourceNodeId: this.state.remoteMode === 'client' && this.state.remoteHubUrl.trim()
-        ? this.localRemoteNodeId
-        : undefined
+      sourceNodeId: this.state.remoteMode === 'client' ? this.localRemoteNodeId : undefined
     };
   }
 
   private async refreshRemoteBridge(): Promise<void> {
     const hubUrl = this.state.remoteHubUrl.trim();
     const tokenState = this.describeRemoteToken();
-    this.state.remoteTokenHint = '这里是当前连接的访问 Key，不是 Hub 全局口令。直连时双方保持一致；Hub 模式下它会随分享配置一起传递，用于访问目标节点。';
+    this.state.remoteTokenHint = 'Hub 模式下 token 用于访问目标节点，双方保持一致。';
     if (this.state.remoteMode !== 'client') {
       this.state.remoteAutoRelayEnabled = false;
     }
@@ -2069,11 +2020,8 @@ class BridgeController {
       this.state.remotePeerLinked = false;
     }
     if (this.state.remoteMode === 'off') {
-      this.remoteCallbackBaseUrl = '';
       this.lastRemoteInterruptPeer = null;
-      await this.unregisterFromHub().catch(() => undefined);
-      await this.remoteServer.stop().catch(() => undefined);
-      this.stopRemoteHeartbeat();
+      this.hubClient.disconnect();
       this.state.remotePeerOptions = [];
       this.state.remotePeerLinked = false;
       this.state.remoteStatus = '未启用';
@@ -2082,55 +2030,29 @@ class BridgeController {
       return;
     }
 
-    try {
-      const port = await this.remoteServer.start(this.state.remoteListenPort, this.state.remoteToken);
-      const endpoints = this.formatHostEndpoints(port);
-      const callbackBaseUrl = this.preferredHubEndpoint(endpoints);
-      this.remoteCallbackBaseUrl = callbackBaseUrl;
+    if (!hubUrl) {
+      this.state.remoteStatus = '未配置 Hub URL';
+      this.state.remoteConnectivity = 'error';
+      this.state.remoteConnectionSnippet = this.buildRemoteConnectionSnippet();
+      return;
+    }
 
-      if (this.state.remoteMode === 'client') {
-        if (hubUrl) {
-          const registered = await this.registerWithHub(callbackBaseUrl, false);
-          await this.refreshHubPeers();
-          this.scheduleRemoteHeartbeat(callbackBaseUrl, false);
-          const selected = this.state.remotePeerOptions.find((item) => item.id === this.state.remotePeerId);
-          this.state.remoteStatus =
-            `客户端模式 -> Hub ${hubUrl} / ${selected?.label || this.state.remotePeerId || '未选择节点'} / 节点数 ${this.state.remotePeerOptions.length}` +
-            ` / 回调 ${registered ? '已就绪' : '注册失败'} / ${tokenState}`;
-        } else {
-          await this.unregisterFromHub().catch(() => undefined);
-          this.stopRemoteHeartbeat();
-          this.state.remotePeerOptions = [];
-          this.state.remoteStatus = `客户端模式 -> ${this.state.remoteUrl || '未配置 URL'} / 回调 ${callbackBaseUrl} / ${tokenState}`;
-        }
-        await this.checkRemoteConnectivity();
-        this.state.remoteConnectionSnippet = this.buildRemoteConnectionSnippet();
-        return;
-      }
+    this.hubClient.reconnect();
 
+    if (this.state.remoteMode === 'client') {
+      const selected = this.state.remotePeerOptions.find((item) => item.id === this.state.remotePeerId);
+      this.state.remoteStatus =
+        `客户端模式 -> Hub ${hubUrl} / ${selected?.label || this.state.remotePeerId || '未选择节点'} / 节点数 ${this.state.remotePeerOptions.length} / ${tokenState}`;
+      await this.checkRemoteConnectivity();
+    } else {
       const availableTools = this.availableHostTools();
       const selectedTool = this.selectedRemoteHostTool();
-      let status = `主机模式已启动: ${endpoints.join(' , ')}`;
-      if (hubUrl) {
-        const registered = await this.registerWithHub(callbackBaseUrl, true);
-        await this.refreshHubPeers();
-        this.scheduleRemoteHeartbeat(callbackBaseUrl, true);
-        status += registered ? ` | Hub 已注册: ${hubUrl}` : ` | Hub 注册失败: ${hubUrl}`;
-      } else {
-        await this.unregisterFromHub().catch(() => undefined);
-        this.stopRemoteHeartbeat();
-        this.state.remotePeerOptions = [];
-      }
+      let status = `主机模式 -> Hub ${hubUrl}`;
       status += availableTools.length > 0
         ? ` | 对外 CLI: ${selectedTool === 'claude' ? 'Claude Code' : 'Codex'}`
         : ' | 未检测到本机可用 CLI';
       this.state.remoteStatus = `${status} | ${tokenState}`;
       this.state.remoteConnectivity = 'ok';
-    } catch (err: any) {
-      this.remoteCallbackBaseUrl = '';
-      this.stopRemoteHeartbeat();
-      this.state.remoteStatus = `主机启动失败: ${err?.message || '未知错误'}`;
-      this.state.remoteConnectivity = 'error';
     }
     this.state.remoteConnectionSnippet = this.buildRemoteConnectionSnippet();
   }
@@ -2147,6 +2069,28 @@ class BridgeController {
       }
     }
     return [...urls];
+  }
+
+  private handleRemoteInvokeWs(payload: {
+    requestId: string; sourceNodeId?: string; text: string;
+    targetTool?: LocalCliTool; targetProjectPath?: string; targetSessionId?: string;
+  }): void {
+    this.currentRemoteInvokeRequestId = payload.requestId;
+    this.handleRemoteInvoke(
+      payload.text,
+      (delta) => this.hubClient.sendDelta(payload.requestId, delta),
+      (text) => this.hubClient.sendDone(payload.requestId, text),
+      {
+        tool: payload.targetTool,
+        projectPath: payload.targetProjectPath,
+        sessionId: payload.targetSessionId,
+        sourceNodeId: payload.sourceNodeId
+      }
+    ).then((result) => {
+      if (!result.ok) this.hubClient.sendError(payload.requestId, result.message);
+    }).catch((err: any) => {
+      this.hubClient.sendError(payload.requestId, err?.message || 'invoke failed');
+    });
   }
 
   private async handleRemoteInvoke(
@@ -2272,16 +2216,11 @@ class BridgeController {
     const exportSessionId = isHost ? this.selectedRemoteHostSessionId(this.selectedRemoteHostProjectPath()) : this.state.remoteTargetSessionId.trim();
     if (isHost) {
       lines.push('mode=client');
-      if (this.state.remoteHubUrl.trim()) {
-        lines.push(`hubUrl=${this.state.remoteHubUrl.trim()}`);
-        lines.push(`peerId=${this.localRemoteNodeId}`);
-      } else {
-        lines.push(`remoteUrl=${this.preferredHubEndpoint(this.formatHostEndpoints(this.state.remoteListenPort))}`);
-      }
+      lines.push(`hubUrl=${this.state.remoteHubUrl.trim()}`);
+      lines.push(`peerId=${this.localRemoteNodeId}`);
     } else {
       lines.push(`mode=${this.state.remoteMode}`);
       if (this.state.remoteHubUrl.trim()) lines.push(`hubUrl=${this.state.remoteHubUrl.trim()}`);
-      if (this.state.remoteUrl.trim()) lines.push(`remoteUrl=${this.state.remoteUrl.trim()}`);
       if (this.state.remotePeerId.trim()) lines.push(`peerId=${this.state.remotePeerId.trim()}`);
     }
     lines.push(`token=${this.state.remoteToken.trim()}`);
@@ -2349,154 +2288,25 @@ class BridgeController {
       this.state.remoteConnectivity = this.state.remoteMode === 'host' ? 'ok' : 'idle';
       return;
     }
-    this.state.remoteConnectivity = 'checking';
-
+    // WebSocket mode: check hub reachability + peer presence
+    const hubUrl = this.state.remoteHubUrl.trim();
+    if (!hubUrl) { this.state.remoteConnectivity = 'error'; return; }
+    if (!this.state.remotePeerId.trim()) { this.state.remoteConnectivity = 'error'; return; }
+    this.state.remoteConnectivity = this.hubClient.isConnected() &&
+      this.state.remotePeerOptions.some((p) => p.id === this.state.remotePeerId)
+      ? 'ok' : 'checking';
+    // Also do a quick HTTP health check on the hub itself
     try {
-      const hubUrl = this.state.remoteHubUrl.trim();
-      if (hubUrl) {
-        const hubHealth = await fetch(`${hubUrl.replace(/\/$/, '')}/health`);
-        if (!hubHealth.ok) {
-          this.state.remoteConnectivity = 'error';
-          return;
-        }
-        if (!this.state.remotePeerId.trim()) {
-          this.state.remoteConnectivity = 'error';
-          return;
-        }
-        const response = await fetch(
-          `${hubUrl.replace(/\/$/, '')}/relay/health?token=${encodeURIComponent(this.state.remoteToken.trim())}&targetNodeId=${encodeURIComponent(this.state.remotePeerId.trim())}`
-        );
-        this.state.remoteConnectivity = response.ok ? 'ok' : 'error';
-        return;
-      }
-
-      const remoteUrl = this.state.remoteUrl.trim();
-      if (!remoteUrl) {
-        this.state.remoteConnectivity = 'error';
-        return;
-      }
-      const baseUrl = remoteUrl.endsWith('/invoke')
-        ? remoteUrl.slice(0, -'/invoke'.length)
-        : remoteUrl.replace(/\/$/, '');
-      const response = await fetch(`${baseUrl}/health`);
-      this.state.remoteConnectivity = response.ok ? 'ok' : 'error';
+      const r = await fetch(`${hubUrl.replace(/\/$/, '')}/health`);
+      if (!r.ok) { this.state.remoteConnectivity = 'error'; return; }
+      if (!this.hubClient.isConnected()) { this.state.remoteConnectivity = 'error'; return; }
+      this.state.remoteConnectivity = this.state.remotePeerOptions.some((p) => p.id === this.state.remotePeerId)
+        ? 'ok' : 'error';
     } catch {
       this.state.remoteConnectivity = 'error';
     }
   }
 
-  private stopRemoteHeartbeat(): void {
-    if (!this.remoteHeartbeatTimer) return;
-    clearInterval(this.remoteHeartbeatTimer);
-    this.remoteHeartbeatTimer = null;
-  }
-
-  private scheduleRemoteHeartbeat(invokeBaseUrl: string, discoverable: boolean): void {
-    this.stopRemoteHeartbeat();
-    this.remoteHeartbeatTimer = setInterval(() => {
-      this.registerWithHub(invokeBaseUrl, discoverable).catch(() => undefined);
-    }, 20_000);
-  }
-
-  private startRemotePeerRefreshLoop(): void {
-    this.stopRemotePeerRefreshLoop();
-    this.remotePeerRefreshTimer = setInterval(() => {
-      if (!this.panel) return;
-      if (!this.state.remoteHubUrl.trim()) return;
-      if (this.state.remoteMode !== 'client' && this.state.remoteMode !== 'host') return;
-      this.refreshRemoteBridge()
-        .then(() => this.sync())
-        .catch(() => undefined);
-    }, 15_000);
-  }
-
-  private stopRemotePeerRefreshLoop(): void {
-    if (!this.remotePeerRefreshTimer) return;
-    clearInterval(this.remotePeerRefreshTimer);
-    this.remotePeerRefreshTimer = null;
-  }
-
-  private async registerWithHub(invokeBaseUrl: string, discoverable: boolean): Promise<boolean> {
-    const hubUrl = this.state.remoteHubUrl.trim();
-    const accessToken = this.state.remoteToken.trim();
-    if (!hubUrl) return false;
-
-    try {
-      const response = await fetch(`${hubUrl.replace(/\/$/, '')}/register`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          nodeId: this.localRemoteNodeId,
-          deviceName: this.state.remoteDeviceName.trim() || os.hostname(),
-          invokeUrl: `${invokeBaseUrl.replace(/\/$/, '')}/invoke`,
-          accessToken,
-          exportSide: this.state.remoteExportSide,
-          discoverable
-        })
-      });
-      return response.ok;
-    } catch {
-      return false;
-    }
-  }
-
-  private async unregisterFromHub(): Promise<void> {
-    const hubUrl = this.state.remoteHubUrl.trim();
-    const accessToken = this.state.remoteToken.trim();
-    if (!hubUrl) return;
-    try {
-      await fetch(`${hubUrl.replace(/\/$/, '')}/unregister`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          nodeId: this.localRemoteNodeId,
-          accessToken
-        })
-      });
-    } catch {
-      return;
-    }
-  }
-
-  private async refreshHubPeers(): Promise<void> {
-    const hubUrl = this.state.remoteHubUrl.trim();
-    if (!hubUrl) {
-      this.state.remotePeerOptions = [];
-      return;
-    }
-
-    try {
-      const response = await fetch(
-        `${hubUrl.replace(/\/$/, '')}/peers?selfId=${encodeURIComponent(this.localRemoteNodeId)}`
-      );
-      if (!response.ok) {
-        this.state.remotePeerOptions = [];
-        return;
-      }
-      const payload = await response.json() as {
-        peers?: Array<{ nodeId?: string; deviceName?: string; invokeUrl?: string; exportSide?: string }>;
-      };
-      const options = (payload.peers || [])
-        .filter((peer) => typeof peer.nodeId === 'string' && peer.nodeId)
-        .map((peer) => ({
-          id: String(peer.nodeId),
-          label: [
-            peer.deviceName || peer.nodeId,
-            peer.exportSide ? `导出${peer.exportSide}` : '',
-            peer.invokeUrl || ''
-          ].filter(Boolean).join(' · ')
-        }));
-      this.state.remotePeerOptions = options;
-      if (!this.state.remotePeerId && options.length === 1) {
-        this.state.remotePeerId = options[0].id;
-      }
-      if (this.state.remotePeerId && !options.some((item) => item.id === this.state.remotePeerId)) {
-        this.state.remotePeerId = '';
-      }
-    } catch {
-      this.state.remotePeerOptions = [];
-    }
-  }
 
   private normalizedResumeId(tool: CliTool, rawValue: string, projectPath: string): string {
     const value = (rawValue || '').trim();
