@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import http from 'node:http';
+import { WebSocketServer } from 'ws';
 
 const args = process.argv.slice(2);
 
@@ -12,9 +13,11 @@ function readArg(name, fallback) {
 
 const port = Number.parseInt(readArg('port', process.env.BRIDGE_HUB_PORT || '9239'), 10);
 const host = readArg('host', process.env.BRIDGE_HUB_HOST || '0.0.0.0');
-const ttlMs = Number.parseInt(readArg('ttl', process.env.BRIDGE_HUB_TTL_MS || '45000'), 10);
 
+// nodeId → { nodeId, deviceName, token, exportSide, discoverable, ws }
 const peers = new Map();
+// requestId → { clientWs, targetNodeId }
+const pendingRequests = new Map();
 
 function sendJson(res, status, body) {
   res.statusCode = status;
@@ -22,217 +25,139 @@ function sendJson(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-function cleanupExpiredPeers() {
-  const now = Date.now();
-  for (const [nodeId, peer] of peers.entries()) {
-    if (now - peer.lastSeenAt > ttlMs) {
-      peers.delete(nodeId);
-    }
+function wsSend(ws, obj) {
+  if (ws.readyState === ws.OPEN) {
+    ws.send(JSON.stringify(obj));
   }
 }
 
-function readJsonBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
-    req.on('end', () => {
-      try {
-        const raw = Buffer.concat(chunks).toString('utf8');
-        resolve(raw ? JSON.parse(raw) : {});
-      } catch (error) {
-        reject(error);
-      }
-    });
-    req.on('error', reject);
-  });
+function visiblePeerList(excludeNodeId) {
+  return [...peers.values()]
+    .filter((p) => p.nodeId !== excludeNodeId && p.discoverable !== false)
+    .map(({ nodeId, deviceName, exportSide }) => ({ nodeId, deviceName, exportSide }));
 }
 
-async function pipeWebStreamToNodeResponse(body, res) {
-  if (!body) {
-    res.end();
-    return;
-  }
-  const reader = body.getReader();
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    if (value) {
-      res.write(Buffer.from(value));
-    }
-  }
-  res.end();
-}
-
-function requirePeerAccessToken(peer, candidate) {
-  if (!peer) return false;
-  const expected = typeof peer.accessToken === 'string' ? peer.accessToken.trim() : '';
-  if (!expected) return true;
-  return typeof candidate === 'string' && candidate === expected;
-}
-
-const server = http.createServer(async (req, res) => {
-  cleanupExpiredPeers();
-
-  if (!req.url) {
-    sendJson(res, 404, { ok: false, message: 'not found' });
-    return;
-  }
-
+const server = http.createServer((req, res) => {
+  if (!req.url) { sendJson(res, 404, { ok: false, message: 'not found' }); return; }
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
   if (req.method === 'GET' && url.pathname === '/health') {
-    sendJson(res, 200, { ok: true, peers: peers.size, ttlMs });
-    return;
-  }
-
-  if (req.method === 'POST' && url.pathname === '/register') {
-    try {
-      const body = await readJsonBody(req);
-      if (typeof body.nodeId !== 'string' || !body.nodeId.trim()) {
-        sendJson(res, 400, { ok: false, message: 'nodeId required' });
-        return;
-      }
-      if (typeof body.invokeUrl !== 'string' || !body.invokeUrl.trim()) {
-        sendJson(res, 400, { ok: false, message: 'invokeUrl required' });
-        return;
-      }
-      peers.set(body.nodeId, {
-        nodeId: body.nodeId,
-        deviceName: typeof body.deviceName === 'string' && body.deviceName.trim() ? body.deviceName.trim() : body.nodeId,
-        invokeUrl: body.invokeUrl.trim(),
-        accessToken: typeof body.accessToken === 'string' ? body.accessToken.trim() : '',
-        exportSide: typeof body.exportSide === 'string' ? body.exportSide : '',
-        discoverable: body.discoverable !== false,
-        lastSeenAt: Date.now()
-      });
-      sendJson(res, 200, { ok: true, nodeId: body.nodeId, ttlMs });
-    } catch (error) {
-      sendJson(res, 500, { ok: false, message: error?.message || 'register failed' });
-    }
+    sendJson(res, 200, { ok: true, peers: peers.size });
     return;
   }
 
   if (req.method === 'GET' && url.pathname === '/peers') {
     const selfId = url.searchParams.get('selfId') || '';
-    const list = [...peers.values()]
-      .filter((peer) => peer.nodeId !== selfId && peer.discoverable !== false)
-      .sort((a, b) => b.lastSeenAt - a.lastSeenAt)
-      .map((peer) => ({
-        nodeId: peer.nodeId,
-        deviceName: peer.deviceName,
-        invokeUrl: peer.invokeUrl,
-        exportSide: peer.exportSide,
-        lastSeenAt: peer.lastSeenAt
-      }));
-    sendJson(res, 200, { ok: true, peers: list });
-    return;
-  }
-
-  if (req.method === 'GET' && url.pathname === '/relay/health') {
-    const targetNodeId = (url.searchParams.get('targetNodeId') || '').trim();
-    if (!targetNodeId) {
-      sendJson(res, 400, { ok: false, message: 'targetNodeId required' });
-      return;
-    }
-    const target = peers.get(targetNodeId);
-    if (!target) {
-      sendJson(res, 404, { ok: false, message: 'target node not found' });
-      return;
-    }
-    if (!requirePeerAccessToken(target, url.searchParams.get('token'))) {
-      sendJson(res, 401, { ok: false, message: 'invalid access token' });
-      return;
-    }
-    try {
-      const healthUrl = target.invokeUrl.replace(/\/invoke\/?$/, '/health');
-      const upstream = await fetch(healthUrl);
-      const text = await upstream.text();
-      res.statusCode = upstream.status;
-      res.setHeader('Content-Type', upstream.headers.get('content-type') || 'application/json; charset=utf-8');
-      res.end(text);
-    } catch (error) {
-      sendJson(res, 502, { ok: false, message: error?.message || 'target health failed' });
-    }
-    return;
-  }
-
-  if (req.method === 'POST' && url.pathname === '/unregister') {
-    try {
-      const body = await readJsonBody(req);
-      const nodeId = typeof body.nodeId === 'string' ? body.nodeId.trim() : '';
-      if (!nodeId) {
-        sendJson(res, 400, { ok: false, message: 'nodeId required' });
-        return;
-      }
-      const existing = peers.get(nodeId);
-      if (existing && !requirePeerAccessToken(existing, body.accessToken)) {
-        sendJson(res, 401, { ok: false, message: 'invalid access token' });
-        return;
-      }
-      peers.delete(nodeId);
-      sendJson(res, 200, { ok: true, nodeId });
-    } catch (error) {
-      sendJson(res, 500, { ok: false, message: error?.message || 'unregister failed' });
-    }
-    return;
-  }
-
-  if (req.method === 'POST' && (url.pathname === '/relay/invoke' || url.pathname === '/relay/interrupt')) {
-    try {
-      const body = await readJsonBody(req);
-      const targetNodeId = typeof body.targetNodeId === 'string' ? body.targetNodeId.trim() : '';
-      if (!targetNodeId) {
-        sendJson(res, 400, { ok: false, message: 'targetNodeId required' });
-        return;
-      }
-      const target = peers.get(targetNodeId);
-      if (!target) {
-        sendJson(res, 404, { ok: false, message: 'target node not found' });
-        return;
-      }
-      if (!requirePeerAccessToken(target, body.token)) {
-        sendJson(res, 401, { ok: false, message: 'invalid access token' });
-        return;
-      }
-
-      const targetUrl = url.pathname === '/relay/invoke'
-        ? target.invokeUrl
-        : target.invokeUrl.replace(/\/invoke\/?$/, '/interrupt');
-
-      const upstream = await fetch(targetUrl, {
-        method: 'POST',
-        headers: url.pathname === '/relay/invoke'
-          ? { 'Content-Type': 'application/json' }
-          : { 'x-bridge-token': typeof target.accessToken === 'string' ? target.accessToken : '' },
-        body: url.pathname === '/relay/invoke'
-          ? JSON.stringify({
-              token: typeof target.accessToken === 'string' ? target.accessToken : '',
-              text: body.text || '',
-              stream: body.stream !== false,
-              targetTool: body.targetTool,
-              targetProjectPath: body.targetProjectPath,
-              targetSessionId: body.targetSessionId,
-              sourceInterruptUrl: body.sourceInterruptUrl,
-              sourceNodeId: body.sourceNodeId
-            })
-          : undefined
-      });
-
-      res.statusCode = upstream.status;
-      const contentType = upstream.headers.get('content-type') || 'application/json; charset=utf-8';
-      res.setHeader('Content-Type', contentType);
-      res.setHeader('Cache-Control', upstream.headers.get('cache-control') || 'no-cache, no-transform');
-      await pipeWebStreamToNodeResponse(upstream.body, res);
-    } catch (error) {
-      sendJson(res, 500, { ok: false, message: error?.message || 'relay failed' });
-    }
+    sendJson(res, 200, { ok: true, peers: visiblePeerList(selfId) });
     return;
   }
 
   sendJson(res, 404, { ok: false, message: 'not found' });
 });
 
-setInterval(cleanupExpiredPeers, Math.max(5000, Math.floor(ttlMs / 2))).unref();
+const wss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (req, socket, head) => {
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit('connection', ws, req);
+  });
+});
+
+wss.on('connection', (ws) => {
+  let registeredNodeId = null;
+
+  ws.on('message', (data) => {
+    let msg;
+    try { msg = JSON.parse(data.toString()); } catch { return; }
+
+    switch (msg.type) {
+      case 'register': {
+        const nodeId = typeof msg.nodeId === 'string' ? msg.nodeId.trim() : '';
+        if (!nodeId) { wsSend(ws, { type: 'error', message: 'nodeId required' }); return; }
+        registeredNodeId = nodeId;
+        peers.set(nodeId, {
+          nodeId,
+          deviceName: typeof msg.deviceName === 'string' && msg.deviceName.trim() ? msg.deviceName.trim() : nodeId,
+          token: typeof msg.token === 'string' ? msg.token.trim() : '',
+          exportSide: typeof msg.exportSide === 'string' ? msg.exportSide : '',
+          discoverable: msg.discoverable !== false,
+          ws
+        });
+        wsSend(ws, { type: 'registered', nodeId });
+        wsSend(ws, { type: 'peers', peers: visiblePeerList(nodeId) });
+        break;
+      }
+
+      case 'invoke': {
+        const requestId = msg.requestId;
+        const targetNodeId = typeof msg.targetNodeId === 'string' ? msg.targetNodeId.trim() : '';
+        const target = peers.get(targetNodeId);
+        if (!target) { wsSend(ws, { type: 'error', requestId, message: 'target node not found' }); return; }
+        const expected = target.token;
+        if (expected && msg.token !== expected) { wsSend(ws, { type: 'error', requestId, message: 'invalid token' }); return; }
+        pendingRequests.set(requestId, { clientWs: ws, targetNodeId });
+        wsSend(target.ws, {
+          type: 'invoke', requestId,
+          sourceNodeId: registeredNodeId,
+          text: msg.text || '',
+          targetTool: msg.targetTool,
+          targetProjectPath: msg.targetProjectPath,
+          targetSessionId: msg.targetSessionId
+        });
+        break;
+      }
+
+      case 'delta': {
+        const pending = pendingRequests.get(msg.requestId);
+        if (pending) wsSend(pending.clientWs, { type: 'delta', requestId: msg.requestId, delta: msg.delta });
+        break;
+      }
+
+      case 'done': {
+        const pending = pendingRequests.get(msg.requestId);
+        if (pending) {
+          pendingRequests.delete(msg.requestId);
+          wsSend(pending.clientWs, { type: 'done', requestId: msg.requestId, text: msg.text });
+        }
+        break;
+      }
+
+      case 'error': {
+        const pending = pendingRequests.get(msg.requestId);
+        if (pending) {
+          pendingRequests.delete(msg.requestId);
+          wsSend(pending.clientWs, { type: 'error', requestId: msg.requestId, message: msg.message });
+        }
+        break;
+      }
+
+      case 'interrupt': {
+        const targetNodeId = typeof msg.targetNodeId === 'string' ? msg.targetNodeId.trim() : '';
+        const target = peers.get(targetNodeId);
+        if (target) wsSend(target.ws, { type: 'interrupt', requestId: msg.requestId });
+        break;
+      }
+
+      case 'ping':
+        wsSend(ws, { type: 'pong' });
+        break;
+    }
+  });
+
+  ws.on('close', () => {
+    if (registeredNodeId) {
+      peers.delete(registeredNodeId);
+      for (const [reqId, pending] of pendingRequests) {
+        if (pending.targetNodeId === registeredNodeId) {
+          wsSend(pending.clientWs, { type: 'error', requestId: reqId, message: 'peer disconnected' });
+          pendingRequests.delete(reqId);
+        }
+      }
+    }
+  });
+
+  ws.on('error', () => {});
+});
 
 server.listen(port, host, () => {
   console.log(`bridge hub listening on http://${host}:${port}`);

@@ -14,7 +14,8 @@
     "media/**",
     "readme.md",
     "LICENSE.md",
-    "package.json"
+    "package.json",
+    "node_modules/ws/**"
   ],
   "engines": {
     "vscode": "^1.90.0"
